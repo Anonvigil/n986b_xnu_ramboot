@@ -1,0 +1,141 @@
+diff --git a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+--- a/osfmk/kern/debug.c
++++ b/osfmk/kern/debug.c
+@@ -1157,10 +1157,20 @@
+ }
+ 
+ extern void loader_return(void);
++#if defined(__arm64__)
++/* A separate Exynos 990 experiment supplies this symbol; other boards retain
++ * their original panic path. */
++extern void n986b_panic_auto_upload(void) __attribute__((weak));
++#endif
+ 
+ void
+ panic_spin_forever(void)
+ {
++#if defined(__arm64__)
++	if (n986b_panic_auto_upload != NULL) {
++		n986b_panic_auto_upload();
++	}
++#endif
+ 	loader_return();
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+diff --git a/osfmk/arm64/loader_return.c b/osfmk/arm64/loader_return.c
+--- a/osfmk/arm64/loader_return.c
++++ b/osfmk/arm64/loader_return.c
+@@ -769,6 +769,113 @@
+ 	loader_exit_without_loader();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++/* This define exists only in the isolated N986B ATE3 RAM experiment.
++ * The pinned UEFI loader does not yet pass b2l_panic_upload=1. A boot argument
++ * with value 0 disables it without changing the loader. No other board gets
++ * this default. Remove the define after a loader with an explicit opt-in is
++ * available. */
++#define N986B_AUTO_UPLOAD_TEST_BUILD 1
++
++#define N986B_PMU_PA              0x15860000UL
++#define N986B_PMU_SIZE            0x4000UL
++#define N986B_PMU_INFORM3         0x080cUL
++#define N986B_PMU_SWRESET         0x3a00UL
++#define N986B_UPLOAD_MAGIC        0x0000ece9U
++#define N986B_SOFTWARE_RESET      2U
++
++static vm_offset_t n986b_auto_upload_pmu;
++static uint32_t n986b_auto_upload_enabled;
++static uint32_t n986b_auto_upload_attempted;
++
++__startup_func
++static void
++n986b_auto_upload_init(void)
++{
++	uint32_t requested = N986B_AUTO_UPLOAD_TEST_BUILD;
++
++	(void)PE_parse_boot_argn("b2l_panic_upload", &requested, sizeof(requested));
++	if (requested != 1 || loader_stub_slot[1] != 0) {
++		return;
++	}
++	n986b_auto_upload_pmu = ml_io_map(N986B_PMU_PA, N986B_PMU_SIZE);
++	if (n986b_auto_upload_pmu != 0) {
++		/* Read-only EL1 access check before the panic path. A fault here is a
++		 * boot-time mapping failure, not evidence of an upload attempt. */
++		uint32_t inform3 = *(volatile uint32_t *)(n986b_auto_upload_pmu + N986B_PMU_INFORM3);
++		loader_log_puts("N986B AUTO UPLOAD: PMU mapped VA ");
++		loader_log_hex(n986b_auto_upload_pmu);
++		loader_log_puts(" INFORM3 ");
++		loader_log_hex(inform3);
++		loader_log_putc('\n');
++		n986b_auto_upload_enabled = 1;
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, n986b_auto_upload_init);
++
++/* Called after the ordinary panic text has been emitted. No allocation, map,
++ * I/O lock, storage call, PSCI request or loader_return on this path. The
++ * single 16 KiB PMU mapping covers both INFORM3 and SWRESET. */
++void
++n986b_panic_auto_upload(void)
++{
++	volatile uint32_t *inform3;
++	volatile uint32_t *swreset;
++	uint32_t prior;
++
++	if (!n986b_auto_upload_enabled || n986b_auto_upload_pmu == 0 ||
++	    loader_stub_slot[1] != 0 ||
++	    (__builtin_arm_rsr64("MPIDR_EL1") & 0xffffffUL) != 0 ||
++	    __atomic_exchange_n(&n986b_auto_upload_attempted, 1, __ATOMIC_ACQ_REL) != 0) {
++		return;
++	}
++
++	/* Keep the same bounded log collection used by loader_return(), and make
++	 * the final bytes visible to the next S-Boot instance before reset. */
++	if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
++	    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024) {
++		loader_log_puts("\n--- panic buffer before auto upload ---\n");
++		for (const char *c = debug_buf_base; c < debug_buf_ptr; c++) {
++			loader_log_putc(*c);
++		}
++	}
++	loader_log_puts("\nN986B AUTO UPLOAD: ATE3 DINFORM ECE9, SWRESET 2\n");
++	n986b_flush_msgbuf();
++	n986b_flush_loader_log();
++
++	inform3 = (volatile uint32_t *)(n986b_auto_upload_pmu + N986B_PMU_INFORM3);
++	swreset = (volatile uint32_t *)(n986b_auto_upload_pmu + N986B_PMU_SWRESET);
++	prior = *inform3;
++	*inform3 = N986B_UPLOAD_MAGIC;
++	__asm__ volatile ("dsb sy" : : : "memory");
++	if (*inform3 != N986B_UPLOAD_MAGIC) {
++		*inform3 = prior;
++		__asm__ volatile ("dsb sy" : : : "memory");
++		return;
++	}
++	*swreset = N986B_SOFTWARE_RESET;
++	__asm__ volatile ("dsb sy" : : : "memory");
++	/* The reset should occur immediately. Keep the original panic path if
++	 * hardware does not reset within three counter seconds. Do not use WFE:
++	 * a missing interrupt could leave this loop asleep forever. */
++	uint64_t started = __builtin_arm_rsr64("CNTVCT_EL0");
++	uint64_t frequency = __builtin_arm_rsr64("CNTFRQ_EL0");
++	/* Some Exynos boot paths leave CNTFRQ_EL0 unset. Keep a bounded wait
++	 * using the 26 MHz architectural timer frequency from the board DTS. */
++	if (frequency < 1000000 || frequency > 1000000000) {
++		frequency = 26000000;
++	}
++	uint64_t timeout = frequency * 3;
++	while (__builtin_arm_rsr64("CNTVCT_EL0") - started < timeout) {
++		__asm__ volatile ("yield" : : : "memory");
++	}
++	*inform3 = prior;
++	__asm__ volatile ("dsb sy" : : : "memory");
++	loader_log_puts("N986B AUTO UPLOAD: reset timeout; original panic path\n");
++	n986b_flush_loader_log();
++}
++#endif /* ARM64_BOARD_CONFIG_EXYNOS990 */
++
+ /*
+  * Bring-up aid: stop here if the loader asked for checkpoint n. Every checkpoint passed is also written to the log the
+  * loader gets back ("[c10][c11]..."), so a kernel that ends before its first line still says how far it came.

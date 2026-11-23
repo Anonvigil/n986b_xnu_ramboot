@@ -21,6 +21,9 @@ These results are separate. The Apple PID 1 experiment used a diagnostic `md0` r
 5. [Earlier, separate XNU 12377 branch](docs/XNU_26_HISTORY.md)
 6. [N986B hardware inputs and driver boundaries](docs/XNU_HARDWARE.md)
 7. [H6 RAM package format and offline Upload A/B verifier](sources/xnu/transport/README.md)
+8. [Early diagnostic PID 1 source](sources/xnu/diagnostic-pid1/README.md)
+9. [What to preserve privately before deleting a workspace](docs/PRESERVATION.md)
+10. [Historical panic-to-Upload result and source delta](docs/PANIC_TO_UPLOAD.md)
 
 The source preparation script reconstructs the H6 and H7 XNU trees from pinned public Scion, Apple XNU and Apple HFS commits, then verifies the changed-file SHA-256 values. This was checked on fresh host checkouts. The transport tools reconstruct the historical H6 package format and verify previously collected Upload A/B bytes, but do not send USB traffic or collect device RAM. The source scripts do not create a bit-identical linked kernel or UEFI FD, and the published UEFI recipe has not reproduced its historical FD byte for byte on a clean host. A fresh phone run requires privately supplied version-matched inputs, a newly paired manifest, and independent Upload-mode A/B checks.
 

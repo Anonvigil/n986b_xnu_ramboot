@@ -4,9 +4,20 @@ These files preserve the N986B H6 host-side **format, transfer plan, and offline
 
 ## What is included
 
+- `stage_1m_91940000.S`: byte-preserved H6 AArch64 callback source. Its source SHA-256 is `3b1a39e48d40de137c945ddc7452ad863aaa6b413127a09dddb087549fb056b7`; the 340-byte assembled stage is pinned separately below. This file alone is not a sender or a bootable image.
 - `h6_manifest.py`: validates the exact historical FD, callback stage, ARM64 XNU Mach-O, and 1 MiB fixture pins; constructs the 4 KiB v3 manifest and 51,712-frame low stream. It performs no device I/O. Its output files are optional and created exclusively.
 - `h6_send_plan.py`: reconstructs the nine setup OUTs, 64-byte `SET_SEL` control payload hashes, 2,048 high frames, 51,712 low frames, and one terminal operation. It only prints a plan. It never opens USB.
 - `verify_h6_upload_ab.py`: checks twelve already-collected A/B pairs against the exact H6 inputs, same-session manifest tag/receipt, UEFI marker and snapshot, XNU scratch commit, and ordered H4/H5/H6 console markers. It only reads local files. The collector that originally obtained those files is described in [H6-LIVE-REFERENCE.md](H6-LIVE-REFERENCE.md); it is not bundled.
+
+On Debian with AArch64 binutils, the preserved callback source assembles to the exact historical 340-byte stage:
+
+```sh
+aarch64-linux-gnu-as -o stage.o stage_1m_91940000.S
+aarch64-linux-gnu-objcopy -O binary --only-section=.text stage.o stage.bin
+sha256sum stage.bin
+```
+
+The expected stage SHA-256 is `5d1f05bd2ef19308fc0e52a00f5da9ac06ff7efe5476574711bb4607333001c7`. This source-to-stage check passed on a Debian host. `stage.o` and `stage.bin` are generated local files and are not distributed here.
 
 ## Dependencies and inputs
 
