@@ -1,0 +1,50 @@
+## @file
+# N986B host-only iOS 16.5/XNU 8796 ABI adapter.
+# The physical branch remains disabled pending memory-map validation.
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+[Defines]
+  INF_VERSION    = 0x0001001B
+  BASE_NAME      = N986BXnuLoader
+  FILE_GUID      = 6993C426-C19A-4C89-8B90-EE39A6E7F8A1
+  MODULE_TYPE    = UEFI_APPLICATION
+  VERSION_STRING = 0.1-ios165-host
+  ENTRY_POINT    = UefiMain
+
+[Sources]
+  N986BXnuLoader.c
+  MachO.c
+  Arena.c
+  DeviceTree.c
+  Xnu8796Layout.c
+  XnuHandoff.S
+  MachO.h
+  Arena.h
+  DeviceTree.h
+  Xnu8796Layout.h
+  BootArgs.h
+  Progress.h
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ArmPkg/ArmPkg.dec
+  CryptoPkg/CryptoPkg.dec
+  EmbeddedPkg/EmbeddedPkg.dec
+
+[LibraryClasses]
+  BaseCryptLib
+  BaseLib
+  BaseMemoryLib
+  CacheMaintenanceLib
+  FdtLib
+  MemoryAllocationLib
+  UefiApplicationEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+
+[Protocols]
+  gEfiLoadedImageProtocolGuid
+  gEfiGraphicsOutputProtocolGuid
+
+[BuildOptions]
+  *_*_*_CC_FLAGS = -DB2L_UEFI_BUILD -DN986B_ENABLE_XNU_HANDOFF=0

@@ -1,0 +1,41 @@
+## @file
+# N986B RAM-only read-only Linux diagnostic branch. Distinct from no-branch.
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+[Defines]
+  INF_VERSION    = 0x0001001B
+  BASE_NAME      = N986BUi10V
+  FILE_GUID      = F9F65EBA-151E-4DFC-AA46-D6015D924DD9
+  MODULE_TYPE    = UEFI_APPLICATION
+  VERSION_STRING = 0.1
+  ENTRY_POINT    = UefiMain
+
+[Sources]
+  N986BUi10V.c
+  RecoveryImage.c
+  RecoveryImage.h
+  N986BFreshFullEct.h
+  LinuxHandoffEct.S
+
+[Packages]
+  MdePkg/MdePkg.dec
+  ArmPkg/ArmPkg.dec
+  CryptoPkg/CryptoPkg.dec
+  EmbeddedPkg/EmbeddedPkg.dec
+
+[Protocols]
+  gEfiLoadedImageProtocolGuid
+
+[LibraryClasses]
+  BaseCryptLib
+  BaseLib
+  BaseMemoryLib
+  CacheMaintenanceLib
+  FdtLib
+  MemoryAllocationLib
+  UefiApplicationEntryPoint
+  UefiBootServicesTableLib
+  UefiLib
+
+[BuildOptions]
+  *_*_*_CC_FLAGS = -DN986B_RECOVERY_ENABLE_HANDOFF=1 -DN986B_RECOVERY_UI_MODE=1 -DN986B_RECOVERY_UI_HIGH_STREAM=1 -DN986B_UI_HIGH_DUAL_BLACKLIST=1

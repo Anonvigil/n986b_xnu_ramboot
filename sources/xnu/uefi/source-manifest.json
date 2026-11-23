@@ -1,0 +1,104 @@
+{
+  "schema": 1,
+  "profile": "SM-N986B XNU 8796 H1 branch v3 UEFI FD reused by live H6",
+  "upstream": {
+    "edk2_platforms_commit": "982212662c71b6c734b7578526071d6b78da3bcc",
+    "edk2_commit": "e7aac7fc137e247edad22f7ee53b9a1fba227397",
+    "simpleinit_commit": "29e062805776db5ab7a61d07ef040d43aed71161",
+    "edk2_exynos_commit": "c00035413a9df469414b31529640bf1da28859db"
+  },
+  "frozen_host_build": {
+    "ffs_sha256": "13cf5236a70f77aeeceadeb3264eee4a181c3c5da42c4509d3cb4c020cd3d45e",
+    "byte_identical_rebuild_from_public_bundle": false,
+    "efi_sha256": "cf097095fa9223b33c8b5c7435fe7e3dccdef7a19d0fcdc7cbac7863ee16068f",
+    "fd_sha256": "b6433e3bdf6ffda64357f46fc592a5d922611241470d942e2f86afa1b19d0201",
+    "phone_test_for_rebuild": false
+  },
+  "boot_app_guid": "6993C426-C19A-4C89-8B90-EE39A6E7F8A1",
+  "source_files": {
+    "board-overrides/GPLDrivers/Library/SimpleInit/src/filesystem/internal.c": {
+      "sha256": "aa70b9f36f7ae149d6fd2ae3df72cebdc71ef18161ff62cfcca44550e6127890",
+      "bytes": 7386
+    },
+    "board-overrides/Platform/RenegadePkg/Library/PlatformBootManagerLib/PlatformBm.c": {
+      "sha256": "bf60d80dc9ffe642fc2ae451009bb70c27d38ab044ddf401f66f295e42cb074a",
+      "bytes": 26461
+    },
+    "Platform/Samsung/exynos990/Research/Ios165Reserve/Map/PlatformMemoryMapLibN986BReserve.c": {
+      "sha256": "326aa8361e36a41b080fad16d9cf71704cca77627618f9d23a8af822cb83c988",
+      "bytes": 6660
+    },
+    "Platform/Samsung/exynos990/Research/Ios165Reserve/Map/PlatformMemoryMapLibN986BReserve.inf": {
+      "sha256": "37e9bc3c48c13d6f437b5c175ca893f9b5af14e75dd12fefe13b63347f468cdf",
+      "bytes": 667
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/c2s-ios165-ro-store-h1-branch-host.dsc": {
+      "sha256": "b5e404470cd86a6dfb50c5e17c213d907f714784070d3bcf5d87293dcef1f809",
+      "bytes": 2280
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/exynos990-ios165-ro-store-h1-branch-host.fdf": {
+      "sha256": "a6c5df1f289c0648d2aaeb7e6ccfd65bba1ebbd7db19a297e37b0e8c3e1bb717",
+      "bytes": 9181
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/Arena.c": {
+      "sha256": "e4ff66ae897defed9956ea0b461df4fe7de7dc0d30b1c7141722f96047cfbc09",
+      "bytes": 4889
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/Arena.h": {
+      "sha256": "86ec27403341258e767404ce8a6433299b123b7009885ff428a79a609d4b6f3a",
+      "bytes": 1929
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/b2l_ro_store.c": {
+      "sha256": "09f5a2e47ef3ceecb8d994c5d7b4b66bd87c0cb5a83245b60f2e54775d65c4cd",
+      "bytes": 5120
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/b2l_ro_store.h": {
+      "sha256": "84496a0dbc698a4b614a74b59703c4c097e73bcb6c230bbaf9f2714b7b0330fd",
+      "bytes": 2598
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/BootArgs.h": {
+      "sha256": "a1e09b2321b487a4a686f0406f4a57133f4a2803d7b346aedeb3de3d2d06577a",
+      "bytes": 1780
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/DeviceTree.c": {
+      "sha256": "c29bacab653928cda86e3106ed86c3fd8bf589eb392ddffc4919c6e52152ef66",
+      "bytes": 9423
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/DeviceTree.h": {
+      "sha256": "7565867548c6afee0322fc3c7c0ea1019a5d5e91c6696550013e9ef252e89884",
+      "bytes": 1057
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/MachO.c": {
+      "sha256": "679c171d045746eb261b382145d40f4f8b20d9d5d3b1ca54f036b71b585de14f",
+      "bytes": 4888
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/MachO.h": {
+      "sha256": "fa0e5b46a752eb14f3e611f6847691802af85bcc575676e25c9aad13f338da7c",
+      "bytes": 870
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/N986BXnuLoader.c": {
+      "sha256": "136f71acd8b13795d7aa7660628d962ff95f97ff875939256ced89f5773afdb5",
+      "bytes": 43517
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/N986BXnuLoader.inf": {
+      "sha256": "8f906928b85000337159384afb10026e48a031df90cbf3a118c3ef5cd673b4ad",
+      "bytes": 1010
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/Progress.h": {
+      "sha256": "5f8ec19efa13e29bf76f93e0f7b6a291ee808852e4ceea91f92aaacf22e2d6cf",
+      "bytes": 924
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/Xnu8796Layout.c": {
+      "sha256": "b3b7fcee4ff458807dd9b3ccf500e0e3adb9b9a492780f940c002a1454cef528",
+      "bytes": 9159
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/Xnu8796Layout.h": {
+      "sha256": "e6e7bfc554ef07edb97ef7cc1ae9bea8b92b6fe6edc6cc7a1f6b19802f4d5e13",
+      "bytes": 2965
+    },
+    "Platform/Samsung/exynos990/Research/Ios165RoStoreH1Branch/Loader/XnuHandoff.S": {
+      "sha256": "02094bfe9073066bf54d095a50bc6305cc78f7512142d58a58e0b0dc9a113ca3",
+      "bytes": 3100
+    }
+  }
+}

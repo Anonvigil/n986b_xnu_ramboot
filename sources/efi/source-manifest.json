@@ -1,0 +1,67 @@
+{
+  "schema": 1,
+  "target": "SM-N986B / N986BXXU0ATE3 / UI10V VTS-off EFI RAM boot",
+  "upstream": {
+    "edk2_exynos": {
+      "repository": "https://github.com/sonic011gamer/edk2-exynos",
+      "commit": "c00035413a9df469414b31529640bf1da28859db",
+      "license_reference": "UPSTREAM_LICENSE and source file headers"
+    },
+    "submodules": {
+      "Common/edk2": {
+        "repository": "https://github.com/tianocore/edk2",
+        "commit": "e7aac7fc137e247edad22f7ee53b9a1fba227397",
+        "license_reference": "Upstream license and source file headers"
+      },
+      "Common/edk2-platforms": {
+        "repository": "https://github.com/tianocore/edk2-platforms",
+        "commit": "982212662c71b6c734b7578526071d6b78da3bcc",
+        "license_reference": "Upstream license and source file headers"
+      },
+      "GPLDrivers/Library/SimpleInit": {
+        "repository": "https://github.com/BigfootACA/simple-init",
+        "commit": "29e062805776db5ab7a61d07ef040d43aed71161",
+        "license_reference": "SIMPLEINIT_LICENSE, upstream notices and source file headers"
+      },
+      "Platform/EFI_Binaries": {
+        "repository": "https://github.com/edk2-porting/edk2-msm-binary",
+        "commit": "87ac13a39d88790fd1a7f4bf5550f14aa3d8ed15",
+        "license_reference": "Upstream submodule notices and component-specific licenses"
+      }
+    }
+  },
+  "source_overlay": {
+    "file_count": 72,
+    "simpleinit_modified_source_files": 22,
+    "edk2_modified_source_files": 31,
+    "generated_stock_ect_header_committed": false
+  },
+  "toolchain": {
+    "llvm_mingw_release": "20261020",
+    "edk2_build_target": "DEBUG_CLANG38",
+    "architecture": "AARCH64",
+    "basetools_executables_built_from_pinned_source_for_this_check": false
+  },
+  "stock_ect_input": {
+    "bytes": 307200,
+    "sha256": "32a642074aa5168aede2cededf3af62c13cd20eb9212517fe517bfbfbbc70caa",
+    "committed": false
+  },
+  "frozen_phone_observed": {
+    "fd": {
+      "file": "N986B-TWRP-UI10V-VTS-OFF-RAM.fd",
+      "sha256": "0ac10b5ae7ed996102d4ff74ee8f0d2002d57088fa804c93a1d2b271ebb06c01"
+    },
+    "efi": {
+      "file": "N986BUi10V.efi",
+      "sha256": "a274548662f9c88167facf96e1bbe3aa0a7bedf2e2e0c7f589364af2abcd1fa5"
+    }
+  },
+  "isolated_source_built_variant": {
+    "build_completed": true,
+    "byte_identical_to_frozen": false,
+    "phone_tested": false,
+    "fd_sha256": "82dd3f219f7b4870fa4fa08e789c9953cc4f5d4715d370d98c94f6294752fc70",
+    "efi_sha256": "6d9729b0e02ec2146a337a4e77a7f51db28a31e26974367a18b2c8908167fee9"
+  }
+}

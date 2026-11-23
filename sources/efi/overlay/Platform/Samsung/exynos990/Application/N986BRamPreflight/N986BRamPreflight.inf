@@ -1,0 +1,27 @@
+## @file
+# N986B RAM-only XNU payload preflight. No storage or XNU handoff.
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+[Defines]
+  INF_VERSION    = 0x0001001B
+  BASE_NAME      = N986BRamPreflight
+  FILE_GUID      = D6C88C43-CE15-4A10-87BE-B089338F946F
+  MODULE_TYPE    = UEFI_APPLICATION
+  VERSION_STRING = 0.1
+  ENTRY_POINT    = UefiMain
+
+[Sources]
+  N986BRamPreflight.c
+
+[Packages]
+  MdePkg/MdePkg.dec
+  CryptoPkg/CryptoPkg.dec
+
+[LibraryClasses]
+  BaseCryptLib
+  BaseLib
+  BaseMemoryLib
+  CacheMaintenanceLib
+  UefiApplicationEntryPoint
+  UefiBootServicesTableLib
+  UefiLib

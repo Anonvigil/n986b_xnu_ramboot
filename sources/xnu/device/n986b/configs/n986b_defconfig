@@ -1,0 +1,4 @@
+# HakiOS defconfig for the Galaxy Note20 Ultra SM-N986B (n986b): the common kernel, the exynos990 family's facts, and this device's own.
+#include common_defconfig
+#include exynos990.config
+#include n986b.config

@@ -1,0 +1,456 @@
+--- a/bsd/dev/B2LRoStoreDevice.c
++++ b/bsd/dev/B2LRoStoreDevice.c
+@@ -36,6 +36,10 @@
+     int last_flags, last_error;
+ } h5_trace;
+ static unsigned h5_probe_passed;
++static unsigned h6_probe_passed;
++static unsigned h7_header_passed;
++static unsigned h7_mount_passed;
++static uint64_t h7_strategy_reads, h7_strategy_writes, h7_mount_reads_before;
+ /* H6 observes the vnode path separately from H5's physio path. Only the two
+  * audited edge reads may run while this receipt is armed. */
+ static struct {
+@@ -84,16 +88,16 @@
+ 
+ 
+ static const uint8_t ro_first_sector_sha256[32] = {
+-    0x1e,0x43,0x3d,0x6d,0x39,0x45,0x0e,0x64,
+-    0x16,0x2e,0x55,0x81,0xfe,0x02,0x63,0x83,
+-    0x09,0x22,0x58,0x7f,0xb6,0xb1,0xf2,0xa3,
+-    0xb3,0xe6,0xda,0x3b,0xd0,0x51,0x52,0xf6
++    0x07, 0x6a, 0x27, 0xc7, 0x9e, 0x5a, 0xce, 0x2a,
++    0x3d, 0x47, 0xf9, 0xdd, 0x2e, 0x83, 0xe4, 0xff,
++    0x6e, 0xa8, 0x87, 0x2b, 0x3c, 0x22, 0x18, 0xf6,
++    0x6c, 0x92, 0xb8, 0x9b, 0x55, 0xf3, 0x65, 0x60
+ };
+ static const uint8_t ro_last_sector_sha256[32] = {
+-    0xc3,0xff,0x82,0xd8,0xbe,0x95,0xb0,0xa7,
+-    0x7b,0xc1,0xba,0x15,0x4c,0xce,0x41,0xc9,
+-    0x88,0xb3,0x30,0xd8,0x3f,0x79,0x24,0x7c,
+-    0xb0,0xc2,0xe4,0xa7,0x2a,0xb4,0xa4,0xda
++    0x07, 0x6a, 0x27, 0xc7, 0x9e, 0x5a, 0xce, 0x2a,
++    0x3d, 0x47, 0xf9, 0xdd, 0x2e, 0x83, 0xe4, 0xff,
++    0x6e, 0xa8, 0x87, 0x2b, 0x3c, 0x22, 0x18, 0xf6,
++    0x6c, 0x92, 0xb8, 0x9b, 0x55, 0xf3, 0x65, 0x60
+ };
+ 
+ /* Exercise the actual bcopy_phys source window before publishing /dev.
+@@ -153,6 +157,7 @@
+         h6_trace.last_flags = (int)buf_flags(bp);
+         h6_trace.last_device = buf_device(bp);
+     }
++    if ((buf_flags(bp) & B_READ) == 0) h7_strategy_writes++;
+     buf_setresid(bp, (uint32_t)length);
+     if (!rodev.registered || minor(buf_device(bp)) != 0) {
+         error = ENXIO;
+@@ -181,7 +186,10 @@
+     if (h5_trace.active) h5_trace.last_error = error;
+     if (h6_trace.active) h6_trace.last_error = error;
+     if (error) buf_seterror(bp, error);
+-    else buf_setresid(bp, 0);
++    else {
++        if (buf_flags(bp) & B_READ) h7_strategy_reads++;
++        buf_setresid(bp, 0);
++    }
+     buf_biodone(bp);
+ }
+ 
+@@ -308,9 +316,9 @@
+             (B_READ | B_PHYS | B_RAW) || h5_trace.last_error != 0)
+         return h5_reject("strategy-receipt", EIO);
+     if (lba == 0)
+-        loader_log_line("B2L-H5-LBA0-CALLBACK-PASS sha256=1e433d6d39450e64162e5581fe0263830922587fb6b1f2a3b3e6da3bd05152f6\n");
++        loader_log_line("B2L-H5-LBA0-CALLBACK-PASS sha256=076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560\n");
+     else
+-        loader_log_line("B2L-H5-LBA2047-CALLBACK-PASS sha256=c3ff82d8be95b0a77bc1ba154cce41c988b330d83f79247cb0c2e4a72ab4a4da\n");
++        loader_log_line("B2L-H5-LBA2047-CALLBACK-PASS sha256=076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560\n");
+     return 0;
+ }
+ 
+@@ -410,9 +418,9 @@
+         (h6_trace.last_flags & B_READ) == 0 || h6_trace.last_error != 0)
+         return h6_reject("specfs-strategy-receipt", EIO);
+     if (lba == 0)
+-        loader_log_line("B2L-H6-LBA0-VNOP-PASS sha256=1e433d6d39450e64162e5581fe0263830922587fb6b1f2a3b3e6da3bd05152f6\n");
++        loader_log_line("B2L-H6-LBA0-VNOP-PASS sha256=076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560\n");
+     else
+-        loader_log_line("B2L-H6-LBA2047-VNOP-PASS sha256=c3ff82d8be95b0a77bc1ba154cce41c988b330d83f79247cb0c2e4a72ab4a4da\n");
++        loader_log_line("B2L-H6-LBA2047-VNOP-PASS sha256=076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560\n");
+     return 0;
+ }
+ 
+@@ -481,7 +489,97 @@
+     vnode_put(vp);
+     loader_log_line("B2L-H6-CLEANUP vnode-rele-put\n");
+     if (reads_passed && error == 0)
+-        loader_log_line("B2L-H6-PASS vblk-vnop-specfs-strategy no-root-alias\n");
++    {
++        h6_probe_passed = 1;
++        loader_log_line("B2L-H6-PASS vblk-vnop-specfs-strategy\n");
++    }
++}
++
++static const uint8_t h7_header_sector_sha256[32] = {
++    0x24, 0xf7, 0x56, 0xcd, 0x68, 0x95, 0x3c, 0xd3,
++    0x85, 0xa2, 0xf2, 0x1e, 0x98, 0x1c, 0xf3, 0xd4,
++    0x2b, 0x31, 0x44, 0xcc, 0x06, 0xbe, 0x0d, 0x90,
++    0x99, 0x7a, 0x1e, 0x21, 0x0f, 0xc6, 0xd4, 0x73
++};
++static const uint8_t h7_full_sha256[32] = {
++    0x84, 0x25, 0x7b, 0x2c, 0x7c, 0x85, 0xa2, 0xcd,
++    0xfe, 0xf0, 0xde, 0xe2, 0x22, 0xd7, 0xd2, 0x46,
++    0x83, 0xca, 0x03, 0x41, 0x1d, 0xcd, 0x44, 0x55,
++    0x86, 0xbe, 0x65, 0x87, 0x0a, 0xad, 0xbd, 0x8a
++};
++
++/* The H4 gate pins the whole physical MiB. This independently checks the
++ * HFS+ volume header on the same read-only physical copy path. */
++static int
++h7_probe_header(struct b2l_ro_device *candidate)
++{
++    uint8_t sector[B2L_RO_STORE_SECTOR], digest[32];
++    SHA256_CTX sha;
++    int error = b2l_ro_device_read(candidate, 1024, sector, sizeof(sector),
++                                   ro_physical_read, NULL);
++    if (error) return error;
++    SHA256_Init(&sha);
++    SHA256_Update(&sha, sector, sizeof(sector));
++    SHA256_Final(digest, &sha);
++    if (memcmp(digest, h7_header_sector_sha256, 32) ||
++        sector[0] != 'H' || sector[1] != '+' ||
++        sector[2] != 0 || sector[3] != 4 ||
++        sector[4] != 0x80 || sector[5] != 0 ||
++        sector[6] != 1 || sector[7] != 0 ||
++        sector[12] != 0 || sector[13] != 0 ||
++        sector[14] != 0 || sector[15] != 0)
++        return EIO;
++    return 0;
++}
++
++/* Only the verified, HFS-header-pinned, H6-vnode-tested dynamic bdev can
++ * become the diagnostic root. No md0 alias and no static major number. */
++int
++b2l_ro_store_h7_rootdev(dev_t *out)
++{
++    if (!out || !rodev.registered || bmajor < 0 ||
++        !h5_probe_passed || !h6_probe_passed || !h7_header_passed ||
++        rodev.store.image_kind != B2L_RO_KIND_DIAGNOSTIC ||
++        rodev.store.length != B2L_RO_STORE_MAX_DIAGNOSTIC ||
++        memcmp(rodev.store.image_sha256, h7_full_sha256, 32)) return ENXIO;
++    *out = makedev(bmajor, 0);
++    return 0;
++}
++
++int
++b2l_ro_store_h7_mount_begin(dev_t dev)
++{
++    dev_t verified;
++    if (b2l_ro_store_h7_rootdev(&verified) || dev != verified ||
++        h7_strategy_writes != 0 || ro_open(dev, FWRITE, S_IFBLK, NULL) != EROFS)
++        return EROFS;
++    h7_mount_passed = 0;
++    h7_mount_reads_before = h7_strategy_reads;
++    return 0;
++}
++
++int
++b2l_ro_store_h7_mount_end(dev_t dev, int mount_error)
++{
++    dev_t verified;
++    if (mount_error) return mount_error;
++    if (b2l_ro_store_h7_rootdev(&verified) ||
++        dev != verified || h7_strategy_reads <= h7_mount_reads_before ||
++        h7_strategy_writes != 0 || b2l_ro_store_block_operation(0) != EROFS)
++        panic("B2L-H7-HFS-MOUNT-PROOF-FAILED reads=%llu writes=%llu",
++              (unsigned long long)h7_strategy_reads,
++              (unsigned long long)h7_strategy_writes);
++    h7_mount_passed = 1;
++    return 0;
++}
++
++int
++b2l_ro_store_h7_mount_verified(dev_t dev)
++{
++    dev_t verified;
++    return h7_mount_passed && !b2l_ro_store_h7_rootdev(&verified) &&
++           verified == dev && h7_strategy_writes == 0 &&
++           h7_strategy_reads > h7_mount_reads_before;
+ }
+ 
+ /* Called once by the H4 early probe only after a v3 UEFI receipt, live DT
+@@ -519,6 +617,10 @@
+         return rc;
+     }
+     loader_log_line("B2L-H4B-DT-CORE-PASS\n");
++    if (memcmp(candidate.store.image_sha256, h7_full_sha256, 32)) return EIO;
++    if (h7_probe_header(&candidate)) return EIO;
++    h7_header_passed = 1;
++    loader_log_line("B2L-H7-HFS-HEADER-PASS sector2-sha256=24f756cd68953cd385a2f21e981cf3d42b3144cc06be0d90997a1e210fc6d473\n");
+     /* The DT and full-physical proof are accepted by the core first.
+      * A bcopy_phys edge failure must leave no published device. */
+     int probe_error = ro_probe_edges(&candidate);
+@@ -526,7 +628,7 @@
+         loader_log_line("B2L-H4-BCOPY-EDGE-REJECT\n");
+         return probe_error;
+     }
+-    loader_log_line("B2L-H4-BCOPY-EDGE-PASS first=1e433d6d39450e64162e5581fe0263830922587fb6b1f2a3b3e6da3bd05152f6 last=c3ff82d8be95b0a77bc1ba154cce41c988b330d83f79247cb0c2e4a72ab4a4da\n");
++    loader_log_line("B2L-H4-BCOPY-EDGE-PASS first=076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560 last=076a27c79e5ace2a3d47f9dd2e83e4ff6ea8872b3c2218f66c92b89b55f36560\n");
+     if (b2l_ro_store_block_operation(0) != EROFS ||
+         b2l_ro_store_char_write() != EROFS ||
+         b2l_ro_store_mutating_ioctl() != EROFS) return EIO;
+--- a/iokit/bsddev/IOKitBSDInit.cpp
++++ b/iokit/bsddev/IOKitBSDInit.cpp
+@@ -39,6 +39,7 @@
+ extern "C" {
+ #include "../../bsd/b2l_ro_device.h"
+ int b2l_ro_store_xnu_register_verified(const struct b2l_ro_proof *proof);
++int b2l_ro_store_h7_rootdev(dev_t *out);
+ }
+ #include <machine/machine_routines.h>
+ 
+@@ -669,10 +670,10 @@
+  * and a bounded bcopy_phys edge read all precede devfs registration.
+  */
+ static const uint8_t b2l_h4_expected_sha256[32] = {
+-    0xb2, 0x6a, 0x12, 0x94, 0x9f, 0xe1, 0xce, 0x56,
+-    0xf5, 0x83, 0x0a, 0x71, 0x87, 0xa2, 0x8b, 0xbf,
+-    0x4b, 0x17, 0x33, 0x62, 0xa7, 0xd0, 0xbe, 0x0c,
+-    0x08, 0x2e, 0x84, 0xe7, 0x00, 0x79, 0x5d, 0x8a
++    0x84, 0x25, 0x7b, 0x2c, 0x7c, 0x85, 0xa2, 0xcd,
++    0xfe, 0xf0, 0xde, 0xe2, 0x22, 0xd7, 0xd2, 0x46,
++    0x83, 0xca, 0x03, 0x41, 0x1d, 0xcd, 0x44, 0x55,
++    0x86, 0xbe, 0x65, 0x87, 0x0a, 0xad, 0xbd, 0x8a
+ };
+ 
+ static uint16_t
+@@ -914,7 +915,7 @@
+         b2l_h4_log(line);
+         return;
+     }
+-    b2l_h4_log("B2L-H4-NO-ROOT-ALIAS /dev/b2lro0\n");
++    b2l_h4_log("B2L-H7-H4-PROOF-REGISTERED /dev/b2lro0\n");
+ }
+ #endif /* __arm64__ */
+ 
+@@ -954,7 +955,7 @@
+ 	char rdEarly[kMaxBootVar];
+ 	uint64_t bsdWait = 30ULL * kSecondScale;
+ 	if (PE_parse_boot_argn("rd", rdEarly, sizeof(rdEarly)) &&
+-	    ((rdEarly[0] == 'm' && rdEarly[1] == 'd') || strncmp(rdEarly, "rvblk", 5) == 0)) {
++	    ((rdEarly[0] == 'm' && rdEarly[1] == 'd') || strncmp(rdEarly, "rvblk", 5) == 0 || strcmp(rdEarly, "b2lro0") == 0)) {
+ 		bsdWait = kSecondScale / 10;
+ 	}
+ 
+@@ -1065,6 +1066,21 @@
+ 		}
+ 	}
+ 
++// Exact H7 diagnostic root. This devfs bdev is not an IOMedia service.
++// Fail closed here: setconf would otherwise silently substitute sd0a.
++if (strcmp(rdBootVar, "b2lro0") == 0) {
++    int h7_error;
++    OSSafeReleaseNULL(matching);
++    h7_error = b2l_ro_store_h7_rootdev(root);
++    if (h7_error) {
++        panic("B2L-H7-ROOTDEV-REJECT errno=%d", h7_error);
++    }
++    strlcpy(rootName, "b2lro0", rootNameSize);
++    *oflags = 0;
++    IOLog("B2L-H7-ROOTDEV b2lro0 major=%d minor=%d\n", major(*root), minor(*root));
++    goto iofrootx;
++}
++
+ //
+ //	A virtio disk (bsd/dev/hakios.virtio_blk.c): rd=rvblk0 roots on the first one
+ //
+--- a/bsd/vfs/vfs_conf.c
++++ b/bsd/vfs/vfs_conf.c
+@@ -109,12 +109,36 @@
+ 
+ #if HFS
+ extern  struct vfsops hfs_vfsops;
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++extern int hfs_mount(struct mount *, vnode_t, user_addr_t, vfs_context_t);
++extern int b2l_ro_store_h7_rootdev(dev_t *);
++extern int b2l_ro_store_h7_mount_begin(dev_t);
++extern int b2l_ro_store_h7_mount_end(dev_t, int);
++extern dev_t rootdev;
++static int
++b2l_h7_hfs_mountroot(mount_t mp, vnode_t devvp, vfs_context_t ctx)
++{
++    dev_t verified;
++    int error;
++    if (b2l_ro_store_h7_rootdev(&verified) || verified != rootdev ||
++        verified != vnode_specrdev(devvp) ||
++        (vfs_flags(mp) & (MNT_RDONLY | MNT_ROOTFS)) !=
++        (MNT_RDONLY | MNT_ROOTFS)) return EINVAL;
++    error = b2l_ro_store_h7_mount_begin(verified);
++    if (!error) {
++        printf("B2L-H7-HFS-MOUNT-BEGIN major=%d minor=%d\n",
++               major(verified), minor(verified));
++        error = hfs_mount(mp, devvp, 0, ctx);
++        error = b2l_ro_store_h7_mount_end(verified, error);
++    }
++    printf("B2L-H7-HFS-MOUNT-END errno=%d\n", error);
++    return error;
++}
++#define B2L_H7_HFS_MOUNTROOT b2l_h7_hfs_mountroot
++#else
++#define B2L_H7_HFS_MOUNTROOT NULL
++#endif
+ #endif /* HFS */
+-#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
+-#define N986B_HFS_MOUNTROOT VFC_VFSCANMOUNTROOT
+-#else
+-#define N986B_HFS_MOUNTROOT 0
+-#endif
+ 
+ #if APFS
+ extern  struct vfsops apfs_vfsops;
+@@ -247,12 +271,11 @@
+ 		.vfc_typenum = FT_HFS,
+ 		.vfc_refcount = 0,
+ 		.vfc_flags = MNT_LOCAL | MNT_DOVOLFS,
+-		.vfc_mountroot = NULL,
+-		.vfc_next = NULL,
+-		.vfc_reserved1 = 0,
+-		.vfc_reserved2 = 0,
+-		/* On N986B, try the existing hfs_mount(data=0) root path. */
+-		.vfc_vfsflags = N986B_HFS_MOUNTROOT | VFC_VFSLOCALARGS | VFC_VFSREADDIR_EXTENDED | VFC_VFS64BITREADY | VFC_VFSVNOP_PAGEOUTV2 |
++		.vfc_mountroot = B2L_H7_HFS_MOUNTROOT,
++		.vfc_next = NULL,
++		.vfc_reserved1 = 0,
++		.vfc_reserved2 = 0,
++		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFSREADDIR_EXTENDED | VFC_VFS64BITREADY | VFC_VFSVNOP_PAGEOUTV2 |
+ 		    VFC_VFSVNOP_PAGEINV2 | VFC_VFSNATIVEXATTR,
+ 		.vfc_descptr = NULL,
+ 		.vfc_descsize = 0,
+@@ -297,12 +320,7 @@
+ 		.vfc_typenum = FT_MOCKFS,
+ 		.vfc_refcount = 0,
+ 		.vfc_flags = MNT_LOCAL,
+-#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
+-		/* A failed HFS mount must not masquerade as a successful mockfs boot. */
+-		.vfc_mountroot = NULL,
+-#else
+ 		.vfc_mountroot = mockfs_mountroot,
+-#endif
+ 		.vfc_next = NULL,
+ 		.vfc_reserved1 = 0,
+ 		.vfc_reserved2 = 0,
+--- a/bsd/vfs/vfs_subr.c
++++ b/bsd/vfs/vfs_subr.c
+@@ -1264,16 +1264,6 @@
+ 			error = VFS_MOUNT(mp, rootvp, 0, ctx);
+ 		}
+ 
+-#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
+-		if (strcmp(vfsp->vfc_name, "hfs") == 0) {
+-			char line[96];
+-			extern void loader_log_line(const char *);
+-			snprintf(line, sizeof(line),
+-			    "B2L ROOTFS: HFS mountroot result=%d\n", error);
+-			printf("%s", line);
+-			loader_log_line(line);
+-		}
+-#endif
+ 
+ 		if (!error) {
+ 			if (bdevvp_rootvp != rootvp) {
+@@ -1398,6 +1388,17 @@
+ 			return 0;
+ 		}
+ 		vfs_rootmountfailed(mp);
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++        /* The attested H7 root may never fall through to mockfs. */
++        if (strcmp(vfsp->vfc_name, "hfs") == 0) {
++            dev_t verified;
++            extern int b2l_ro_store_h7_rootdev(dev_t *);
++            if (!b2l_ro_store_h7_rootdev(&verified) && verified == rootdev) {
++                printf("B2L-H7-HFS-FAIL-CLOSED errno=%d\n", error);
++                return error ? error : EIO;
++            }
++        }
++#endif
+ #if CONFIG_MACF
+ fail:
+ #endif
+--- a/bsd/kern/bsd_init.c
++++ b/bsd/kern/bsd_init.c
+@@ -892,6 +892,14 @@
+ 			/*NOTREACHED*/
+ 		}
+ #endif
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++        {
++            char rd_h7[16] = "";
++            if (PE_parse_boot_argn("rd", rd_h7, sizeof(rd_h7)) &&
++                strcmp(rd_h7, "b2lro0") == 0)
++                panic("B2L-H7-HFS-ROOT-FAILED errno=%d", err);
++        }
++#endif
+ 		printf("cannot mount root, errno = %d\n", err);
+ 	}
+ 
+@@ -911,6 +919,28 @@
+ 	set_rootvnode(init_rootvnode);
+ 	lck_rw_unlock_exclusive(&rootvnode_rw_lock);
+ 	init_rootvnode = NULLVP;  /* use rootvnode after this point */
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++    {
++        char rd_h7[16] = "";
++        if (PE_parse_boot_argn("rd", rd_h7, sizeof(rd_h7)) &&
++            strcmp(rd_h7, "b2lro0") == 0) {
++            extern int b2l_ro_store_h7_rootdev(dev_t *);
++            extern int b2l_ro_store_h7_mount_verified(dev_t);
++            dev_t verified;
++            mount_t root_mount = mountlist.tqh_first;
++            struct statfs *stats = vfs_statfs(root_mount);
++            if (b2l_ro_store_h7_rootdev(&verified) || verified != rootdev ||
++                !b2l_ro_store_h7_mount_verified(rootdev) ||
++                vnode_vtype(rootvnode) != VDIR ||
++                strcmp(stats->f_fstypename, "hfs") != 0 ||
++                (vfs_flags(root_mount) & (MNT_RDONLY | MNT_ROOTFS)) !=
++                    (MNT_RDONLY | MNT_ROOTFS))
++                panic("B2L-H7-ROOT-VNODE-PROOF-FAILED");
++            printf("B2L-H7-ROOT-VNODE-PASS fs=hfs major=%d minor=%d ro=1 rootfs=1 writes=0\n",
++                   major(rootdev), minor(rootdev));
++        }
++    }
++#endif
+ 
+ 
+ 	/*
+@@ -920,7 +950,17 @@
+ 	char rd_virtio[16] = "";
+ 	bool rooted_virtio = PE_parse_boot_argn("rd", rd_virtio, sizeof(rd_virtio)) && strncmp(rd_virtio, "rvblk", 5) == 0;
+ 
+-	if (!bsd_rooted_ramdisk() && !rooted_virtio) {
++	bool rooted_h7 = false;
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++    {
++        char rd_h7[16] = "";
++        extern int b2l_ro_store_h7_mount_verified(dev_t);
++        rooted_h7 = PE_parse_boot_argn("rd", rd_h7, sizeof(rd_h7)) &&
++            strcmp(rd_h7, "b2lro0") == 0 &&
++            b2l_ro_store_h7_mount_verified(rootdev);
++    }
++#endif
++	if (!bsd_rooted_ramdisk() && !rooted_virtio && !rooted_h7) {
+ 		boolean_t require_rootauth = FALSE;
+ 
+ #if XNU_TARGET_OS_OSX && defined(__arm64__)
+@@ -1138,6 +1178,12 @@
+ 
+ 	err = IOFindBSDRoot(rootdevice, sizeof(rootdevice), &rootdev, &flags);
+ 	if (err) {
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++        char rd_h7[16] = "";
++        if (PE_parse_boot_argn("rd", rd_h7, sizeof(rd_h7)) &&
++            strcmp(rd_h7, "b2lro0") == 0)
++            panic("B2L-H7-ROOTDEV-UNAVAILABLE errno=%d", err);
++#endif
+ 		printf("setconf: IOFindBSDRoot returned an error (%d);"
+ 		    "setting rootdevice to 'sd0a'.\n", err);     /* XXX DEBUG TEMP */
+ 		rootdev = makedev( 6, 0 );

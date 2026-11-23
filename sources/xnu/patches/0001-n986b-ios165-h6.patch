@@ -1,0 +1,1997 @@
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/b2l_ro_device.c b/bsd/b2l_ro_device.c
+--- a/bsd/b2l_ro_device.c	1970-01-01 09:00:00.000000000 +0900
++++ b/bsd/b2l_ro_device.c	2026-11-09 15:27:52.573329241 +0900
+@@ -0,0 +1,58 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++#include "b2l_ro_device.h"
++#include <sys/errno.h>
++#include <libkern/libkern.h>
++
++int b2l_ro_device_init(struct b2l_ro_device *dev, const void *property,
++                       size_t length, const struct b2l_ro_proof *proof)
++{
++    struct b2l_ro_store s;
++    if (dev) memset(dev, 0, sizeof(*dev));
++    if (!dev || !proof || !proof->efi_reserved_owner_confirmed ||
++        !proof->read_only_copy_window_confirmed ||
++        b2l_ro_store_decode(property, length, &s) != 0 ||
++        proof->observed_reservation_tag != s.reservation_tag ||
++        memcmp(proof->observed_image_sha256, s.image_sha256, 32) != 0)
++        return EINVAL;
++    memset(dev, 0, sizeof(*dev));
++    dev->store = s;
++    dev->registered = 1;
++    return 0;
++}
++
++int b2l_ro_device_read(struct b2l_ro_device *dev, uint64_t offset,
++                       void *destination, size_t length,
++                       b2l_ro_phys_read read_phys, void *ctx)
++{
++    uint64_t pa;
++    uint8_t *dst = destination;
++    if (!dev || !dev->registered || !destination || !read_phys ||
++        b2l_ro_store_span(&dev->store, offset, length, &pa)) return EINVAL;
++    while (length) {
++        size_t page_left = B2L_RO_STORE_PAGE - (size_t)(pa & (B2L_RO_STORE_PAGE - 1U));
++        size_t n = length < page_left ? length : page_left;
++        int error = read_phys(ctx, pa, dst, n);
++        if (error) return error;
++        pa += n;
++        dst += n;
++        length -= n;
++    }
++    return 0;
++}
++
++int b2l_ro_device_query(const struct b2l_ro_device *dev,
++                        enum b2l_ro_query query, uint64_t *answer)
++{
++    if (!dev || !dev->registered || !answer) return EINVAL;
++    switch (query) {
++    case B2L_RO_QUERY_SECTOR_SIZE: *answer = B2L_RO_STORE_SECTOR; return 0;
++    case B2L_RO_QUERY_PHYSICAL_BLOCK_SIZE: *answer = B2L_RO_STORE_PAGE; return 0;
++    case B2L_RO_QUERY_BLOCK_COUNT:
++        *answer = dev->store.length / B2L_RO_STORE_SECTOR; return 0;
++    case B2L_RO_QUERY_WRITABLE: *answer = 0; return 0;
++    case B2L_RO_QUERY_MAX_READ_BLOCKS:
++        *answer = B2L_RO_STORE_MAX_DIAGNOSTIC / B2L_RO_STORE_SECTOR; return 0;
++    case B2L_RO_QUERY_MAX_WRITE_BLOCKS: *answer = 0; return 0;
++    default: return EROFS;
++    }
++}
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/b2l_ro_device.h b/bsd/b2l_ro_device.h
+--- a/bsd/b2l_ro_device.h	1970-01-01 09:00:00.000000000 +0900
++++ b/bsd/b2l_ro_device.h	2026-11-09 15:27:52.572715628 +0900
+@@ -0,0 +1,41 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++#ifndef B2L_RO_DEVICE_H
++#define B2L_RO_DEVICE_H
++#include "b2l_ro_store.h"
++
++struct b2l_ro_proof {
++    uint64_t observed_reservation_tag;
++    uint8_t observed_image_sha256[32];
++    int efi_reserved_owner_confirmed;
++    int read_only_copy_window_confirmed;
++};
++
++struct b2l_ro_device {
++    struct b2l_ro_store store;
++    int registered;
++};
++
++/* The supplied proof must originate outside the DT bytes. A caller is not
++ * allowed to mark an unobserved digest or EFI descriptor as verified. */
++int b2l_ro_device_init(struct b2l_ro_device *dev, const void *dt_property,
++                       size_t property_length, const struct b2l_ro_proof *proof);
++
++/* Each callback invocation remains within one 4 KiB physical page. */
++typedef int (*b2l_ro_phys_read)(void *ctx, uint64_t source_pa,
++                                void *destination, size_t bytes);
++int b2l_ro_device_read(struct b2l_ro_device *dev, uint64_t offset,
++                       void *destination, size_t length,
++                       b2l_ro_phys_read read_phys, void *ctx);
++
++enum b2l_ro_query {
++    B2L_RO_QUERY_SECTOR_SIZE,
++    B2L_RO_QUERY_PHYSICAL_BLOCK_SIZE,
++    B2L_RO_QUERY_BLOCK_COUNT,
++    B2L_RO_QUERY_WRITABLE,
++    B2L_RO_QUERY_MAX_READ_BLOCKS,
++    B2L_RO_QUERY_MAX_WRITE_BLOCKS
++};
++int b2l_ro_device_query(const struct b2l_ro_device *dev,
++                        enum b2l_ro_query query, uint64_t *answer);
++
++#endif
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/b2l_ro_store.c b/bsd/b2l_ro_store.c
+--- a/bsd/b2l_ro_store.c	1970-01-01 09:00:00.000000000 +0900
++++ b/bsd/b2l_ro_store.c	2026-11-09 15:15:44.916204694 +0900
+@@ -0,0 +1,120 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++#include "b2l_ro_store.h"
++#include <sys/errno.h>
++#include <libkern/libkern.h>
++
++static const uint8_t magic[8] = { 'B', '2', 'L', 'R', 'O', 'V', '1', 0 };
++
++static uint16_t le16(const uint8_t *p)
++{ return (uint16_t)p[0] | (uint16_t)((uint16_t)p[1] << 8); }
++static uint32_t le32(const uint8_t *p)
++{ return (uint32_t)le16(p) | ((uint32_t)le16(p + 2) << 16); }
++static uint64_t le64(const uint8_t *p)
++{ return (uint64_t)le32(p) | ((uint64_t)le32(p + 4) << 32); }
++static void put16(uint8_t *p, uint16_t v)
++{ p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static void put32(uint8_t *p, uint32_t v)
++{ put16(p, (uint16_t)v); put16(p + 2, (uint16_t)(v >> 16)); }
++static void put64(uint8_t *p, uint64_t v)
++{ put32(p, (uint32_t)v); put32(p + 4, (uint32_t)(v >> 32)); }
++
++int b2l_ro_store_geometry(const struct b2l_ro_store *s)
++{
++    uint8_t digest_or = 0;
++    if (!s || s->reservation_tag == 0 ||
++        (s->base & (B2L_RO_STORE_PAGE - 1U)) != 0 ||
++        (s->length & (B2L_RO_STORE_PAGE - 1U)) != 0 ||
++        s->base < B2L_RO_STORE_BASE || s->base >= B2L_RO_STORE_END ||
++        s->length == 0 || s->length > B2L_RO_STORE_MAX_DIAGNOSTIC ||
++        s->length > B2L_RO_STORE_END - s->base ||
++        /* This v1 gate is pinned to the first witness/diagnostic interval. */
++        s->base != B2L_RO_STORE_BASE ||
++        (s->image_kind == B2L_RO_KIND_WITNESS &&
++         s->length != B2L_RO_STORE_PAGE) ||
++        (s->image_kind == B2L_RO_KIND_DIAGNOSTIC &&
++         s->length != B2L_RO_STORE_MAX_DIAGNOSTIC) ||
++        (s->image_kind != B2L_RO_KIND_WITNESS &&
++         s->image_kind != B2L_RO_KIND_DIAGNOSTIC)) return EINVAL;
++    /* [0x940...,0x9e0...) cannot intersect [0x900...,0x940...). */
++    if (s->base < B2L_RO_ARENA_END &&
++        s->length > B2L_RO_ARENA_BASE - s->base) return EINVAL;
++    for (unsigned i = 0; i < sizeof(s->image_sha256); ++i)
++        digest_or |= s->image_sha256[i];
++    return digest_or ? 0 : EINVAL;
++}
++
++int b2l_ro_store_disjoint_live(const struct b2l_ro_store *s,
++                               const struct b2l_ro_range *regions,
++                               size_t count)
++{
++    if (b2l_ro_store_geometry(s) || !regions ||
++        count != B2L_RO_LIVE_REGION_COUNT) return EINVAL;
++    for (size_t i = 0; i < count; ++i) {
++        uint64_t end;
++        if (regions[i].base == 0 || regions[i].length == 0 ||
++            regions[i].length > UINT64_MAX - regions[i].base) return EINVAL;
++        end = regions[i].base + regions[i].length;
++        if (s->base < end && regions[i].base < s->base + s->length)
++            return EINVAL;
++    }
++    return 0;
++}
++
++int b2l_ro_store_encode(uint8_t out[B2L_RO_STORE_V1_BYTES],
++                        const struct b2l_ro_store *s)
++{
++    if (!out || b2l_ro_store_geometry(s)) return EINVAL;
++    memset(out, 0, B2L_RO_STORE_V1_BYTES);
++    memcpy(out, magic, sizeof(magic));
++    put16(out + 8, 1);
++    put16(out + 10, B2L_RO_STORE_V1_BYTES);
++    put32(out + 12, B2L_RO_FLAGS);
++    put64(out + 16, s->base);
++    put64(out + 24, s->length);
++    put32(out + 32, B2L_RO_STORE_SECTOR);
++    put32(out + 36, s->image_kind);
++    memcpy(out + 40, s->image_sha256, 32);
++    put64(out + 72, s->reservation_tag);
++    return 0;
++}
++
++int b2l_ro_store_decode(const void *wire, size_t length,
++                        struct b2l_ro_store *out)
++{
++    struct b2l_ro_store s;
++    const uint8_t *p = wire;
++    if (!p || !out || length != B2L_RO_STORE_V1_BYTES ||
++        memcmp(p, magic, sizeof(magic)) != 0 ||
++        le16(p + 8) != 1 || le16(p + 10) != B2L_RO_STORE_V1_BYTES ||
++        le32(p + 12) != B2L_RO_FLAGS ||
++        le32(p + 32) != B2L_RO_STORE_SECTOR) return EINVAL;
++    s.base = le64(p + 16);
++    s.length = le64(p + 24);
++    s.image_kind = le32(p + 36);
++    memcpy(s.image_sha256, p + 40, 32);
++    s.reservation_tag = le64(p + 72);
++    if (b2l_ro_store_geometry(&s)) return EINVAL;
++    *out = s;
++    return 0;
++}
++
++int b2l_ro_store_span(const struct b2l_ro_store *s, uint64_t offset,
++                      size_t length, uint64_t *pa)
++{
++    if (!pa || b2l_ro_store_geometry(s) || length == 0 ||
++        (offset & (B2L_RO_STORE_SECTOR - 1U)) ||
++        (length & (B2L_RO_STORE_SECTOR - 1U)) ||
++        offset > s->length || length > s->length - offset) return EINVAL;
++    /* Geometry has proved base+length does not overflow. */
++    *pa = s->base + offset;
++    return 0;
++}
++
++int b2l_ro_store_open_flags(int fflags, int fwrite_mask)
++{ return (fflags & fwrite_mask) ? EROFS : 0; }
++int b2l_ro_store_block_operation(int is_read)
++{ return is_read ? 0 : EROFS; }
++int b2l_ro_store_char_write(void)
++{ return EROFS; }
++int b2l_ro_store_mutating_ioctl(void)
++{ return EROFS; }
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/b2l_ro_store.h b/bsd/b2l_ro_store.h
+--- a/bsd/b2l_ro_store.h	1970-01-01 09:00:00.000000000 +0900
++++ b/bsd/b2l_ro_store.h	2026-11-09 15:15:44.915591744 +0900
+@@ -0,0 +1,60 @@
++/* SPDX-License-Identifier: BSD-2-Clause */
++#ifndef B2L_RO_STORE_H
++#define B2L_RO_STORE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++/* Explicit little-endian wire ABI, independent of C struct packing. */
++#define B2L_RO_STORE_V1_BYTES 80U
++#define B2L_RO_STORE_PAGE 4096U
++#define B2L_RO_STORE_SECTOR 512U
++#define B2L_RO_STORE_MAX_DIAGNOSTIC (1024U * 1024U)
++#define B2L_RO_STORE_BASE UINT64_C(0x940000000)
++#define B2L_RO_STORE_END  UINT64_C(0x9e0000000)
++#define B2L_RO_ARENA_BASE UINT64_C(0x900000000)
++#define B2L_RO_ARENA_END  UINT64_C(0x940000000)
++#define B2L_RO_FLAG_READ_ONLY 1U
++#define B2L_RO_FLAG_NO_EXEC   2U
++#define B2L_RO_FLAGS (B2L_RO_FLAG_READ_ONLY | B2L_RO_FLAG_NO_EXEC)
++#define B2L_RO_KIND_WITNESS 1U
++#define B2L_RO_KIND_DIAGNOSTIC 2U
++
++struct b2l_ro_store {
++    uint64_t base;
++    uint64_t length;
++    uint64_t reservation_tag;
++    uint32_t image_kind;
++    uint8_t image_sha256[32];
++};
++
++enum { B2L_RO_LIVE_REGION_COUNT = 6 };
++struct b2l_ro_range { uint64_t base, length; };
++
++/* Caller supplies EFI image/FD, stack, live FDT, USB stream, Upload snapshot,
++ * and framebuffer. All six must be present and disjoint from the image. */
++int b2l_ro_store_disjoint_live(const struct b2l_ro_store *store,
++                               const struct b2l_ro_range *regions,
++                               size_t region_count);
++
++/* Return 0 on acceptance. All other values are rejection. The digest is a
++ * claimed image identity; the caller must compare it with independently
++ * computed bytes before exposing a device. */
++int b2l_ro_store_encode(uint8_t out[B2L_RO_STORE_V1_BYTES],
++                        const struct b2l_ro_store *store);
++int b2l_ro_store_decode(const void *wire, size_t length,
++                        struct b2l_ro_store *out);
++int b2l_ro_store_geometry(const struct b2l_ro_store *store);
++
++/* A block request is sector-aligned and wholly within the image. Zero-length
++ * requests are rejected so no end-of-device ambiguity enters the driver. */
++int b2l_ro_store_span(const struct b2l_ro_store *store, uint64_t offset,
++                      size_t length, uint64_t *physical_address);
++
++/* Generic transport gates used by host tests and by the kernel adapter. */
++int b2l_ro_store_open_flags(int fflags, int fwrite_mask);
++int b2l_ro_store_block_operation(int is_read);
++int b2l_ro_store_char_write(void);
++int b2l_ro_store_mutating_ioctl(void);
++
++#endif
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/conf/files b/bsd/conf/files
+--- a/bsd/conf/files	2026-11-23 21:31:46.143729903 +0900
++++ b/bsd/conf/files	2026-11-09 15:15:44.917916994 +0900
+@@ -731,3 +731,6 @@
+ bsd/skywalk/packet/pbufpool.c			optional skywalk
+ bsd/skywalk/packet/pbufpool_kern.c		optional skywalk
+ bsd/dev/cpu_copy_in_cksum_gen.c			optional skywalk
++bsd/b2l_ro_store.c standard
++bsd/b2l_ro_device.c standard
++bsd/dev/B2LRoStoreDevice.c standard
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/dev/B2LRoStoreDevice.c b/bsd/dev/B2LRoStoreDevice.c
+--- a/bsd/dev/B2LRoStoreDevice.c	1970-01-01 09:00:00.000000000 +0900
++++ b/bsd/dev/B2LRoStoreDevice.c	2026-11-09 17:16:25.955832772 +0900
+@@ -0,0 +1,563 @@
++/* SPDX-License-Identifier: BSD-2-Clause
++ * Host-only XNU 8796 adapter candidate. Deliberately absent from XNU build
++ * lists and from the known-good image. No md0 alias or root registration. */
++#include "../b2l_ro_device.h"
++#include <libkern/libkern.h>
++#include <libkern/crypto/sha2.h>
++#include <mach/mach_types.h>
++#include <miscfs/devfs/devfs.h>
++#include <pexpert/device_tree.h>
++#include <sys/buf.h>
++#include <sys/conf.h>
++#include <sys/disk.h>
++#include <sys/errno.h>
++#include <sys/fcntl.h>
++#include <sys/param.h>
++#include <sys/systm.h>
++#include <sys/uio.h>
++#include <sys/stat.h>
++#include <sys/vnode.h>
++#include <sys/vnode_if.h>
++#include <vm/pmap.h>
++
++extern void bcopy_phys(addr64_t from, addr64_t to, vm_size_t bytes);
++extern addr64_t kvtophys(vm_offset_t va);
++extern void mapping_set_mod(ppnum_t pn);
++
++static struct b2l_ro_device rodev;
++static int bmajor = -1, cmajor = -1;
++static void *bnode, *cnode;
++/* H5 is a one-shot pre-root physio/strategy diagnostic. It does not prove
++ * block vnode lookup or VNOP_STRATEGY; that is a separate later gate. */
++static struct {
++    unsigned active, calls, reads, writes;
++    uint64_t last_lba;
++    uint32_t last_count;
++    int last_flags, last_error;
++} h5_trace;
++static unsigned h5_probe_passed;
++/* H6 observes the vnode path separately from H5's physio path. Only the two
++ * audited edge reads may run while this receipt is armed. */
++static struct {
++    unsigned active, spec_calls, calls, reads, writes;
++    uint64_t last_lba;
++    uint32_t last_count;
++    int last_flags, last_error;
++    dev_t last_device, last_spec_device;
++} h6_trace;
++extern void loader_log_line(const char *line);
++
++static int
++ro_open(dev_t dev, int flags, __unused int type, __unused proc_t p)
++{
++    if (minor(dev) != 0 || !rodev.registered) return ENXIO;
++    return b2l_ro_store_open_flags(flags, FWRITE);
++}
++
++static int
++ro_close(__unused dev_t dev, __unused int flags, __unused int type,
++         __unused proc_t p)
++{ return 0; }
++
++/* Split both source and destination at 4 KiB physical boundaries before
++ * kvtophys(). XNU may advertise a larger VM page than this hardware uses. */
++static int
++ro_physical_read(__unused void *ctx, uint64_t source_pa,
++                 void *destination, size_t bytes)
++{
++    uintptr_t va = (uintptr_t)destination;
++    while (bytes) {
++        size_t dst_page_left = B2L_RO_STORE_PAGE - (va & (B2L_RO_STORE_PAGE - 1U));
++        size_t src_page_left = B2L_RO_STORE_PAGE - (source_pa & (B2L_RO_STORE_PAGE - 1U));
++        size_t n = bytes < dst_page_left ? bytes : dst_page_left;
++        if (n > src_page_left) n = src_page_left;
++        addr64_t dst_pa = kvtophys((vm_offset_t)va);
++        if (dst_pa == 0) return EFAULT;
++        bcopy_phys((addr64_t)source_pa, dst_pa, (vm_size_t)n);
++        mapping_set_mod((ppnum_t)(dst_pa >> 12));
++        source_pa += n;
++        va += n;
++        bytes -= n;
++    }
++    return 0;
++}
++
++
++static const uint8_t ro_first_sector_sha256[32] = {
++    0x1e,0x43,0x3d,0x6d,0x39,0x45,0x0e,0x64,
++    0x16,0x2e,0x55,0x81,0xfe,0x02,0x63,0x83,
++    0x09,0x22,0x58,0x7f,0xb6,0xb1,0xf2,0xa3,
++    0xb3,0xe6,0xda,0x3b,0xd0,0x51,0x52,0xf6
++};
++static const uint8_t ro_last_sector_sha256[32] = {
++    0xc3,0xff,0x82,0xd8,0xbe,0x95,0xb0,0xa7,
++    0x7b,0xc1,0xba,0x15,0x4c,0xce,0x41,0xc9,
++    0x88,0xb3,0x30,0xd8,0x3f,0x79,0x24,0x7c,
++    0xb0,0xc2,0xe4,0xa7,0x2a,0xb4,0xa4,0xda
++};
++
++/* Exercise the actual bcopy_phys source window before publishing /dev.
++ * This is bounded to the two 512-byte edge sectors and is not a root read. */
++static int
++ro_probe_edges(struct b2l_ro_device *candidate)
++{
++    struct {
++        uint64_t before;
++        uint8_t bytes[B2L_RO_STORE_SECTOR];
++        uint64_t after;
++    } probe;
++    uint8_t digest[32];
++    SHA256_CTX ctx;
++    const uint64_t offsets[2] = {
++        0, B2L_RO_STORE_MAX_DIAGNOSTIC - B2L_RO_STORE_SECTOR
++    };
++    const uint8_t *pins[2] = { ro_first_sector_sha256, ro_last_sector_sha256 };
++    for (unsigned edge = 0; edge < 2; ++edge) {
++        probe.before = 0xb2a4c1d2e3f40123ULL;
++        probe.after = 0x3276a4d1e2f39905ULL;
++        memset(probe.bytes, 0xa5, sizeof(probe.bytes));
++        int error = b2l_ro_device_read(candidate, offsets[edge], probe.bytes,
++                                       sizeof(probe.bytes), ro_physical_read, NULL);
++        if (error) return error;
++        if (probe.before != 0xb2a4c1d2e3f40123ULL ||
++            probe.after != 0x3276a4d1e2f39905ULL) return EIO;
++        SHA256_Init(&ctx);
++        SHA256_Update(&ctx, probe.bytes, sizeof(probe.bytes));
++        SHA256_Final(digest, &ctx);
++        if (memcmp(digest, pins[edge], sizeof(digest)) != 0) return EIO;
++    }
++    return 0;
++}
++
++static void
++ro_strategy(buf_t bp)
++{
++    int error = 0;
++    caddr_t va = NULL;
++    uint64_t sector;
++    size_t length = buf_count(bp);
++    if (h5_trace.active) {
++        h5_trace.calls++;
++        if (buf_flags(bp) & B_READ) h5_trace.reads++;
++        else h5_trace.writes++;
++        h5_trace.last_lba = (uint64_t)buf_blkno(bp);
++        h5_trace.last_count = (uint32_t)length;
++        h5_trace.last_flags = (int)buf_flags(bp);
++    }
++    if (h6_trace.active) {
++        h6_trace.calls++;
++        if (buf_flags(bp) & B_READ) h6_trace.reads++;
++        else h6_trace.writes++;
++        h6_trace.last_lba = (uint64_t)buf_blkno(bp);
++        h6_trace.last_count = (uint32_t)length;
++        h6_trace.last_flags = (int)buf_flags(bp);
++        h6_trace.last_device = buf_device(bp);
++    }
++    buf_setresid(bp, (uint32_t)length);
++    if (!rodev.registered || minor(buf_device(bp)) != 0) {
++        error = ENXIO;
++    } else if ((error = b2l_ro_store_block_operation((buf_flags(bp) & B_READ) != 0)) != 0) {
++        /* This guard is before buf_map and before any physical operation. */
++    } else if (buf_blkno(bp) < 0 || length == 0) {
++        error = EINVAL;
++    } else {
++        sector = (uint64_t)buf_blkno(bp);
++        if (sector > UINT64_MAX / B2L_RO_STORE_SECTOR ||
++            b2l_ro_store_span(&rodev.store,
++                              sector * B2L_RO_STORE_SECTOR,
++                              length, &sector) != 0) {
++            error = EINVAL;
++        } else if (buf_map(bp, &va) != 0) {
++            error = EFAULT;
++        } else {
++            /* span returns a PA only as validation; read recalculates from
++             * the validated sector offset and bounds each copy to a page. */
++            error = b2l_ro_device_read(&rodev,
++                                       (uint64_t)buf_blkno(bp) * B2L_RO_STORE_SECTOR,
++                                       va, length, ro_physical_read, NULL);
++            buf_unmap(bp);
++        }
++    }
++    if (h5_trace.active) h5_trace.last_error = error;
++    if (h6_trace.active) h6_trace.last_error = error;
++    if (error) buf_seterror(bp, error);
++    else buf_setresid(bp, 0);
++    buf_biodone(bp);
++}
++
++static int
++ro_ioctl(dev_t dev, u_long cmd, caddr_t data,
++         __unused int flags, __unused proc_t p)
++{
++    uint64_t v;
++    if (!rodev.registered || minor(dev) != 0) return ENXIO;
++    if (!data) return EROFS;
++    switch (cmd) {
++    case DKIOCGETBLOCKSIZE:
++        *(uint32_t *)data = B2L_RO_STORE_SECTOR; return 0;
++    case DKIOCGETPHYSICALBLOCKSIZE:
++        *(uint32_t *)data = B2L_RO_STORE_PAGE; return 0;
++    case DKIOCGETBLOCKCOUNT:
++        b2l_ro_device_query(&rodev, B2L_RO_QUERY_BLOCK_COUNT, &v);
++        *(uint64_t *)data = v; return 0;
++    case DKIOCISWRITABLE:
++        *(uint32_t *)data = 0; return 0;
++    case DKIOCGETMAXBLOCKCOUNTREAD:
++        b2l_ro_device_query(&rodev, B2L_RO_QUERY_MAX_READ_BLOCKS, &v);
++        *(uint64_t *)data = v; return 0;
++    case DKIOCGETMAXBLOCKCOUNTWRITE:
++        *(uint64_t *)data = 0; return 0;
++    case DKIOCSETBLOCKSIZE:
++        /* spec_open probes 512 without changing this immutable geometry. */
++        return *(uint32_t *)data == B2L_RO_STORE_SECTOR ? 0 : EROFS;
++    default:
++        return b2l_ro_store_mutating_ioctl();
++    }
++}
++
++static int
++ro_size(dev_t dev)
++{ return rodev.registered && minor(dev) == 0 ? B2L_RO_STORE_SECTOR : -1; }
++
++static int
++ro_char_read(dev_t dev, struct uio *uio, __unused int flags)
++{
++    if (!rodev.registered || minor(dev) != 0) return ENXIO;
++    return physio(ro_strategy, NULL, dev, B_READ, minphys, uio,
++                  B2L_RO_STORE_SECTOR);
++}
++
++static int
++ro_char_write(__unused dev_t dev, __unused struct uio *uio,
++              __unused int flags)
++{ return b2l_ro_store_char_write(); }
++
++static const struct bdevsw ro_bdevsw = {
++    .d_open = ro_open, .d_close = ro_close, .d_strategy = ro_strategy,
++    .d_ioctl = ro_ioctl, .d_dump = eno_dump, .d_psize = ro_size,
++    .d_type = D_DISK,
++};
++static const struct cdevsw ro_cdevsw = {
++    .d_open = ro_open, .d_close = ro_close, .d_read = ro_char_read,
++    .d_write = ro_char_write, .d_ioctl = ro_ioctl,
++    .d_stop = eno_stop, .d_reset = eno_reset, .d_ttys = NULL,
++    .d_select = eno_select, .d_mmap = eno_mmap, .d_strategy = eno_strat,
++    .d_reserved_1 = eno_getc, .d_reserved_2 = eno_putc, .d_type = D_DISK,
++};
++
++/* H5 runs immediately after H4b registration, before root mount. The
++ * diagnostic root on this device does not mount, so a post-/dev hook would
++ * never execute. ro_char_read uses the in-tree physio implementation with
++ * B_READ and a kernel-space UIO, then calls the registered ro_strategy.
++ * This is a driver strategy callback gate, NOT a block vnode/VNOP gate. */
++static int
++h5_reject(const char *step, int error)
++{
++    char line[128];
++    snprintf(line, sizeof(line), "B2L-H5-REJECT step=%s errno=%d\n", step, error);
++    loader_log_line(line);
++    return error ? error : EIO;
++}
++
++static int
++h5_read_sector(uint64_t lba, const uint8_t pin[32])
++{
++    struct {
++        uint64_t before;
++        uint8_t bytes[B2L_RO_STORE_SECTOR];
++        uint64_t after;
++    } guarded;
++    uint8_t digest[32];
++    SHA256_CTX sha;
++    uio_t uio;
++    unsigned prior_calls = h5_trace.calls;
++    unsigned prior_reads = h5_trace.reads;
++    user_ssize_t residual;
++    int error;
++
++    guarded.before = 0xb205a1c2d3e4f611ULL;
++    guarded.after = 0x116f4e3d2c1a50b2ULL;
++    memset(guarded.bytes, 0xa5, sizeof(guarded.bytes));
++    uio = uio_create(1, (off_t)(lba * B2L_RO_STORE_SECTOR),
++                     UIO_SYSSPACE, UIO_READ);
++    if (uio == NULL) return h5_reject("uio-create", ENOMEM);
++    error = uio_addiov(uio, (user_addr_t)(uintptr_t)guarded.bytes,
++                       B2L_RO_STORE_SECTOR);
++    if (error) {
++        uio_free(uio);
++        return h5_reject("uio-addiov", error);
++    }
++    error = ro_char_read(makedev(cmajor, 0), uio, 0);
++    residual = uio_resid(uio);
++    uio_free(uio);
++    if (error || residual != 0)
++        return h5_reject("physio-read", error ? error : EIO);
++    if (guarded.before != 0xb205a1c2d3e4f611ULL ||
++        guarded.after != 0x116f4e3d2c1a50b2ULL)
++        return h5_reject("canary", EIO);
++    SHA256_Init(&sha);
++    SHA256_Update(&sha, guarded.bytes, sizeof(guarded.bytes));
++    SHA256_Final(digest, &sha);
++    if (memcmp(digest, pin, sizeof(digest)) != 0)
++        return h5_reject("sha256", EIO);
++    if (h5_trace.calls != prior_calls + 1 ||
++        h5_trace.reads != prior_reads + 1 ||
++        h5_trace.writes != 0 || h5_trace.last_lba != lba ||
++        h5_trace.last_count != B2L_RO_STORE_SECTOR ||
++        (h5_trace.last_flags & (B_READ | B_PHYS | B_RAW)) !=
++            (B_READ | B_PHYS | B_RAW) || h5_trace.last_error != 0)
++        return h5_reject("strategy-receipt", EIO);
++    if (lba == 0)
++        loader_log_line("B2L-H5-LBA0-CALLBACK-PASS sha256=1e433d6d39450e64162e5581fe0263830922587fb6b1f2a3b3e6da3bd05152f6\n");
++    else
++        loader_log_line("B2L-H5-LBA2047-CALLBACK-PASS sha256=c3ff82d8be95b0a77bc1ba154cce41c988b330d83f79247cb0c2e4a72ab4a4da\n");
++    return 0;
++}
++
++static void
++h5_probe_strategy_callback(void)
++{
++    loader_log_line("B2L-H5-ENTER pre-root char-physio\n");
++    if (!rodev.registered || cmajor < 0) {
++        h5_reject("registration-absent", ENXIO);
++        return;
++    }
++    memset(&h5_trace, 0, sizeof(h5_trace));
++    h5_trace.active = 1;
++    if (h5_read_sector(0, ro_first_sector_sha256) != 0) goto done;
++    if (h5_read_sector(2047, ro_last_sector_sha256) != 0) goto done;
++    if (h5_trace.calls != 2 || h5_trace.reads != 2 || h5_trace.writes != 0) {
++        h5_reject("no-write-counter", EIO);
++        goto done;
++    }
++    loader_log_line("B2L-H5-NO-WRITE calls=2 reads=2 writes=0\n");
++    loader_log_line("B2L-H5-PASS char-physio-strategy-only no-vnode no-root-alias\n");
++    h5_probe_passed = 1;
++done:
++    h5_trace.active = 0;
++}
++
++
++/* Called by spec_strategy immediately before dispatch to bdevsw.d_strategy.
++ * This is receipt-only instrumentation, never an I/O operation. */
++void
++b2l_ro_store_h6_spec_enter(dev_t dev)
++{
++    if (h6_trace.active && dev == makedev(bmajor, 0)) {
++        h6_trace.spec_calls++;
++        h6_trace.last_spec_device = dev;
++    }
++}
++
++static int
++h6_reject(const char *step, int error)
++{
++    char line[128];
++    snprintf(line, sizeof(line), "B2L-H6-REJECT step=%s errno=%d\n", step, error);
++    loader_log_line(line);
++    return error ? error : EIO;
++}
++
++/* This is a raw iobuf through a real VBLK vnode, not a direct call to
++ * ro_strategy and not a buffer-cache or root-filesystem read. The sequence
++ * follows the in-tree wdev_io pattern in bsd/dev/hakios.apfs_check.c. */
++static int
++h6_read_vblk_sector(vnode_t vp, uint64_t lba, const uint8_t pin[32])
++{
++    struct {
++        uint64_t before;
++        uint8_t bytes[B2L_RO_STORE_SECTOR];
++        uint64_t after;
++    } guarded;
++    SHA256_CTX sha;
++    uint8_t digest[32];
++    buf_t bp;
++    unsigned prior_calls = h6_trace.calls;
++    unsigned prior_spec_calls = h6_trace.spec_calls;
++    int error;
++
++    guarded.before = 0xb206a1c2d3e4f711ULL;
++    guarded.after = 0x117f4e3d2c1a60b2ULL;
++    memset(guarded.bytes, 0xa5, sizeof(guarded.bytes));
++    bp = buf_alloc(vp);
++    if (bp == NULL) return h6_reject("buf-alloc", ENOMEM);
++    buf_reset(bp, B_READ);
++    buf_setblkno(bp, (daddr64_t)lba);
++    buf_setlblkno(bp, (daddr64_t)lba);
++    buf_setcount(bp, B2L_RO_STORE_SECTOR);
++    buf_setdataptr(bp, (uintptr_t)guarded.bytes);
++    error = VNOP_STRATEGY(bp);
++    if (error == 0) error = (int)buf_biowait(bp);
++    if (error == 0 && (buf_resid(bp) != 0 ||
++                       buf_count(bp) != B2L_RO_STORE_SECTOR)) error = EIO;
++    buf_free(bp);
++    if (error) return h6_reject("vnop-strategy", error);
++    if (guarded.before != 0xb206a1c2d3e4f711ULL ||
++        guarded.after != 0x117f4e3d2c1a60b2ULL)
++        return h6_reject("canary", EIO);
++    SHA256_Init(&sha);
++    SHA256_Update(&sha, guarded.bytes, sizeof(guarded.bytes));
++    SHA256_Final(digest, &sha);
++    if (memcmp(digest, pin, sizeof(digest)) != 0)
++        return h6_reject("sha256", EIO);
++    if (h6_trace.spec_calls != prior_spec_calls + 1 ||
++        h6_trace.calls != prior_calls + 1 ||
++        h6_trace.reads != h6_trace.calls || h6_trace.writes != 0 ||
++        h6_trace.last_lba != lba ||
++        h6_trace.last_count != B2L_RO_STORE_SECTOR ||
++        h6_trace.last_device != makedev(bmajor, 0) ||
++        h6_trace.last_spec_device != makedev(bmajor, 0) ||
++        (h6_trace.last_flags & B_READ) == 0 || h6_trace.last_error != 0)
++        return h6_reject("specfs-strategy-receipt", EIO);
++    if (lba == 0)
++        loader_log_line("B2L-H6-LBA0-VNOP-PASS sha256=1e433d6d39450e64162e5581fe0263830922587fb6b1f2a3b3e6da3bd05152f6\n");
++    else
++        loader_log_line("B2L-H6-LBA2047-VNOP-PASS sha256=c3ff82d8be95b0a77bc1ba154cce41c988b330d83f79247cb0c2e4a72ab4a4da\n");
++    return 0;
++}
++
++static void
++h6_probe_vblk_vnop(void)
++{
++    vnode_t vp = NULLVP;
++    vfs_context_t context;
++    dev_t dev;
++    uint32_t block_size = B2L_RO_STORE_SECTOR;
++    uint64_t block_count = 0;
++    int error;
++    int reads_passed = 0;
++
++    loader_log_line("B2L-H6-ENTER pre-root vblk-vnop-strategy\n");
++    if (!h5_probe_passed || !rodev.registered || bmajor < 0 || cmajor < 0) {
++        h6_reject("h5-or-registration-absent", ENXIO);
++        return;
++    }
++    /* bdevvp internally panics on OPEN failure. Reject known causes before
++     * constructing its vnode. The H4b core already pins diagnostic geometry,
++     * but repeat the immutable 512/2048 and FREAD/ioctl checks at this gate. */
++    dev = makedev(bmajor, 0);
++    if (b2l_ro_store_geometry(&rodev.store) != 0 ||
++        rodev.store.image_kind != B2L_RO_KIND_DIAGNOSTIC ||
++        rodev.store.base != B2L_RO_STORE_BASE ||
++        rodev.store.length != B2L_RO_STORE_MAX_DIAGNOSTIC ||
++        b2l_ro_store_block_operation(0) != EROFS ||
++        ro_open(dev, FREAD, S_IFBLK, NULL) != 0 ||
++        ro_ioctl(dev, DKIOCGETBLOCKSIZE, (caddr_t)&block_size, 0, NULL) != 0 ||
++        block_size != B2L_RO_STORE_SECTOR ||
++        ro_ioctl(dev, DKIOCSETBLOCKSIZE, (caddr_t)&block_size, FWRITE, NULL) != 0 ||
++        ro_ioctl(dev, DKIOCGETBLOCKCOUNT, (caddr_t)&block_count, 0, NULL) != 0 ||
++        block_count != 2048 ||
++        ro_ioctl(dev, DKIOCSETBLOCKSIZE, (caddr_t)&block_size, FWRITE, NULL) != 0) {
++        h6_reject("bdevvp-preflight", EINVAL);
++        return;
++    }
++    loader_log_line("B2L-H6-PREFLIGHT geometry=512x2048 fread=1 set512x2=1\n");
++    /* bdevvp is the canonical XNU pre-root constructor used by
++     * vfs_mountroot. It may panic internally if fsync/invalidate/open fail;
++     * H5 success and the immutable geometry gate are preconditions here. */
++    error = bdevvp(dev, &vp);
++    if (error || vp == NULLVP) {
++        h6_reject("bdevvp", error ? error : EIO);
++        return;
++    }
++    loader_log_line("B2L-H6-BDEVVP-PASS vblk-open-fread\n");
++    context = vfs_context_kernel();
++    memset(&h6_trace, 0, sizeof(h6_trace));
++    h6_trace.active = 1;
++    if (h6_read_vblk_sector(vp, 0, ro_first_sector_sha256) != 0) goto done;
++    if (h6_read_vblk_sector(vp, 2047, ro_last_sector_sha256) != 0) goto done;
++    if (h6_trace.spec_calls != 2 || h6_trace.calls != 2 ||
++        h6_trace.reads != 2 || h6_trace.writes != 0) {
++        h6_reject("no-write-counter", EIO);
++        goto done;
++    }
++    loader_log_line("B2L-H6-NO-WRITE spec=2 calls=2 reads=2 writes=0\n");
++    reads_passed = 1;
++done:
++    h6_trace.active = 0;
++    error = VNOP_CLOSE(vp, FREAD, context);
++    if (error) h6_reject("vnop-close", error);
++    vnode_rele(vp);
++    vnode_put(vp);
++    loader_log_line("B2L-H6-CLEANUP vnode-rele-put\n");
++    if (reads_passed && error == 0)
++        loader_log_line("B2L-H6-PASS vblk-vnop-specfs-strategy no-root-alias\n");
++}
++
++/* Called once by the H4 early probe only after a v3 UEFI receipt, live DT
++ * match, full 1 MiB physical digest and read-only copy-window check. The
++ * first/last 512-byte bcopy probe must also pass before devfs publication. */
++int
++b2l_ro_store_xnu_register_verified(const struct b2l_ro_proof *proof)
++{
++    DTEntry chosen;
++    void const *property;
++    unsigned int length;
++    struct b2l_ro_device candidate;
++    char line[128];
++    int rc;
++    if (rodev.registered) return EALREADY;
++    /* SecureDT functions return kSuccess=1, not 0. The H4 gate rejected
++     * a successful lookup before its core or edge checks could run. */
++    rc = SecureDTLookupEntry(0, "/chosen", &chosen);
++    if (rc != kSuccess) {
++        snprintf(line, sizeof(line), "B2L-H4B-DT-LOOKUP-REJECT rc=%d\n", rc);
++        loader_log_line(line);
++        return EINVAL;
++    }
++    rc = SecureDTGetProperty(chosen, "b2l,ro-store-v1", &property, &length);
++    if (rc != kSuccess) {
++        snprintf(line, sizeof(line), "B2L-H4B-DT-PROP-REJECT rc=%d\n", rc);
++        loader_log_line(line);
++        return EINVAL;
++    }
++    rc = b2l_ro_device_init(&candidate, property, length, proof);
++    if (rc != 0) {
++        snprintf(line, sizeof(line),
++                 "B2L-H4B-CORE-REJECT rc=%d length=%u\n", rc, length);
++        loader_log_line(line);
++        return rc;
++    }
++    loader_log_line("B2L-H4B-DT-CORE-PASS\n");
++    /* The DT and full-physical proof are accepted by the core first.
++     * A bcopy_phys edge failure must leave no published device. */
++    int probe_error = ro_probe_edges(&candidate);
++    if (probe_error) {
++        loader_log_line("B2L-H4-BCOPY-EDGE-REJECT\n");
++        return probe_error;
++    }
++    loader_log_line("B2L-H4-BCOPY-EDGE-PASS first=1e433d6d39450e64162e5581fe0263830922587fb6b1f2a3b3e6da3bd05152f6 last=c3ff82d8be95b0a77bc1ba154cce41c988b330d83f79247cb0c2e4a72ab4a4da\n");
++    if (b2l_ro_store_block_operation(0) != EROFS ||
++        b2l_ro_store_char_write() != EROFS ||
++        b2l_ro_store_mutating_ioctl() != EROFS) return EIO;
++    loader_log_line("B2L-H4-WRITE-GATES-PASS\n");
++    bmajor = bdevsw_add(-1, &ro_bdevsw);
++    if (bmajor < 0) return ENOSPC;
++    cmajor = cdevsw_add_with_bdev(-1, &ro_cdevsw, bmajor);
++    if (cmajor < 0) {
++        bdevsw_remove(bmajor, &ro_bdevsw);
++        bmajor = -1;
++        return ENOSPC;
++    }
++    rodev = candidate;
++    bnode = devfs_make_node(makedev(bmajor, 0), DEVFS_BLOCK,
++                            UID_ROOT, GID_OPERATOR, 0440, "b2lro0");
++    cnode = devfs_make_node(makedev(cmajor, 0), DEVFS_CHAR,
++                            UID_ROOT, GID_OPERATOR, 0440, "rb2lro0");
++    if (!bnode || !cnode) {
++        if (bnode) devfs_remove(bnode);
++        if (cnode) devfs_remove(cnode);
++        rodev.registered = 0;
++        cdevsw_remove(cmajor, &ro_cdevsw);
++        bdevsw_remove(bmajor, &ro_bdevsw);
++        cmajor = bmajor = -1;
++        return ENOMEM;
++    }
++    snprintf(line, sizeof(line),
++             "B2L-H4-REGISTER-OK b2lro0=%d rb2lro0=%d sectors=2048\n",
++             bmajor, cmajor);
++    loader_log_line(line);
++    h5_probe_strategy_callback();
++    h6_probe_vblk_vnop();
++    return 0;
++}
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/kern/kern_exec.c b/bsd/kern/kern_exec.c
+--- a/bsd/kern/kern_exec.c	2026-11-23 21:31:45.162360590 +0900
++++ b/bsd/kern/kern_exec.c	2026-11-09 02:15:51.872922303 +0900
+@@ -1159,6 +1159,10 @@
+  */
+ /* Bring-up aid: with boot-arg systrace set, say which stage of an exec refused the image. */
+ static TUNABLE(uint32_t, exec_trace, "systrace", 0);
++#if 1 /* isolated EXYNOS990 ARM64 build */
++/* This isolated N986B build records PID 1 exec facts in the RAM log. */
++extern void loader_log_line(const char *line);
++#endif
+ 
+ static int
+ exec_mach_imgact(struct image_params *imgp)
+@@ -1749,6 +1753,17 @@
+ 		}
+ 		/* Set the stack */
+ 		thread_setuserstack(thread, ap);
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++		if (proc_getpid(p) == 1) {
++			char line[160];
++			user_addr_t saved_sp = thread_adjuserstack(thread, 0);
++			snprintf(line, sizeof(line),
++			    "B2L SPINIT: programmed=0x%llx saved=0x%llx mod16=%llu\n",
++			    (unsigned long long)ap, (unsigned long long)saved_sp,
++			    (unsigned long long)(saved_sp & 15));
++			loader_log_line(line);
++		}
++#endif
+ 	}
+ 
+ 	if (load_result.dynlinker || load_result.is_rosetta) {
+@@ -2203,6 +2218,13 @@
+ 	}
+ 
+ 	error = exec_check_permissions(imgp);
++#if 1 /* isolated EXYNOS990 ARM64 build */
++	if (proc_getpid(p) == 1) {
++		char line[96];
++		snprintf(line, sizeof(line), "B2L EXECPROBE permission=%d\n", error);
++		loader_log_line(line);
++	}
++#endif
+ 	if (error && exec_trace) {
+ 		printf("exectrace: %s: exec_check_permissions failed: %d\n", imgp->ip_ndp->ni_cnd.cn_pnbuf, error);
+ 	}
+@@ -2221,12 +2243,33 @@
+ 	    vfs_context_ucred(imgp->ip_vfs_context),
+ 	    &resid, vfs_context_proc(imgp->ip_vfs_context));
+ 	if (error) {
++#if 1 /* isolated EXYNOS990 ARM64 build */
++		if (proc_getpid(p) == 1) {
++			char line[96];
++			snprintf(line, sizeof(line), "B2L EXECPROBE read_error=%d\n", error);
++			loader_log_line(line);
++		}
++#endif
+ 		goto bad;
+ 	}
+ 
+ 	if (resid) {
+ 		memset(imgp->ip_vdata + (PAGE_SIZE - resid), 0x0, resid);
+ 	}
++#if 1 /* isolated EXYNOS990 ARM64 build */
++	if (proc_getpid(p) == 1) {
++		static const char digits[] = "0123456789abcdef";
++		const unsigned char *head = (const unsigned char *)imgp->ip_vdata;
++		char hex[65], line[128];
++		for (unsigned int n = 0; n < 32; n++) {
++			hex[2 * n] = digits[head[n] >> 4];
++			hex[2 * n + 1] = digits[head[n] & 15];
++		}
++		hex[64] = 0;
++		snprintf(line, sizeof(line), "B2L EXECPROBE read=0 resid=%d head32=%s\n", resid, hex);
++		loader_log_line(line);
++	}
++#endif
+ 
+ encapsulated_binary:
+ 	/* Limit the number of iterations we will attempt on each binary */
+@@ -2237,6 +2280,14 @@
+ 	error = -1;
+ 	for (i = 0; error == -1 && execsw[i].ex_imgact != NULL; i++) {
+ 		error = (*execsw[i].ex_imgact)(imgp);
++#if 1 /* isolated EXYNOS990 ARM64 build */
++		if (proc_getpid(p) == 1) {
++			char line[128];
++			snprintf(line, sizeof(line), "B2L EXECPROBE activator=%d name=%s result=%d\n",
++			    i, execsw[i].ex_name, error);
++			loader_log_line(line);
++		}
++#endif
+ 
+ 		switch (error) {
+ 		/* case -1: not claimed: continue */
+@@ -5561,6 +5612,29 @@
+ 	 * one for the NULLs terminating the argv, envv, and apple areas.
+ 	 */
+ 	ptr_area_size = (imgp->ip_argc + imgp->ip_envc + imgp->ip_applec + 3) * ptr_size;
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++	if (ptr_size == 8) {
++		user_addr_t candidate_sp = stack - ptr_area_size - ptr_size;
++		user_addr_t misalignment = candidate_sp & 15;
++		if (misalignment == 8) {
++			/* Leave one pointer-sized gap above argv, preserving argc/argv adjacency. */
++			stack -= 8;
++		} else if (misalignment != 0) {
++			error = EINVAL;
++			goto bad;
++		}
++		if (proc_getpid(p) == 1) {
++			char line[160];
++			snprintf(line, sizeof(line),
++			    "B2L SPALIGN: pre=0x%llx pad=%llu post=0x%llx argc=%d ptrs=%d\n",
++			    (unsigned long long)candidate_sp,
++			    (unsigned long long)misalignment,
++			    (unsigned long long)(stack - ptr_area_size - ptr_size),
++			    imgp->ip_argc, ptr_area_size / ptr_size);
++			loader_log_line(line);
++		}
++	}
++#endif
+ 	stack -= ptr_area_size;
+ 	ptr_area = stack;
+ 
+@@ -6444,6 +6518,16 @@
+ 	if ((error = vnode_getattr(vp, vap, imgp->ip_vfs_context)) != 0) {
+ 		return error;
+ 	}
++#if 1 /* isolated EXYNOS990 ARM64 build */
++	if (proc_getpid(p) == 1) {
++		char line[160];
++		snprintf(line, sizeof(line),
++		    "B2L EXECPROBE vnode_size=%llu mode=%o fileid=%llu\n",
++		    (unsigned long long)vap->va_data_size, (unsigned int)vap->va_mode,
++		    (unsigned long long)vap->va_fileid);
++		loader_log_line(line);
++	}
++#endif
+ 
+ 	/*
+ 	 * Ensure that at least one execute bit is on - otherwise root
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/kern/makesyscalls.sh b/bsd/kern/makesyscalls.sh
+--- a/bsd/kern/makesyscalls.sh	2026-11-23 21:31:44.851993013 +0900
++++ b/bsd/kern/makesyscalls.sh	2026-11-08 20:19:31.000000000 +0900
+@@ -671,14 +671,14 @@
+ 		}
+ 
+ 		printf("#if CONFIG_REQUIRES_U32_MUNGING\n") > sysent
+-		printf("\t{ \(sy_call_t *\)(void (*)(void))%s, %s, %s, %s, %s},",
++		printf("\t{ (sy_call_t *)(void (*)(void))%s, %s, %s, %s, %s},",
+ 				tempname, munge32, munge_ret, argssize, size32) > sysent
+ 		linesize = length(tempname) + length(munge32) + \
+ 			length(munge_ret) + length(argssize) + length(size32) + 28
+ 		align_comment(linesize, 88, sysent)
+ 		printf("/* %d = %s%s*/\n", syscall_num, funcname, additional_comments) > sysent
+ 		printf("#else\n") > sysent
+-		printf("\t{ \(sy_call_t *\)(void (*)(void))%s, %s, %s, %s},\n",
++		printf("\t{ (sy_call_t *)(void (*)(void))%s, %s, %s, %s},\n",
+ 				tempname, munge_ret, argssize, size32) > sysent
+ 		printf("#endif\n") > sysent
+ 		
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/miscfs/specfs/spec_vnops.c b/bsd/miscfs/specfs/spec_vnops.c
+--- a/bsd/miscfs/specfs/spec_vnops.c	2026-11-23 21:31:44.879992843 +0900
++++ b/bsd/miscfs/specfs/spec_vnops.c	2026-11-09 17:16:25.957095004 +0900
+@@ -2668,6 +2668,11 @@
+ 
+ 	typedef int strategy_fcn_ret_t(struct buf *bp);
+ 
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++    /* H6 receipt: count only the read-only RAM device while its test runs. */
++    extern void b2l_ro_store_h6_spec_enter(dev_t dev);
++    b2l_ro_store_h6_spec_enter(bdev);
++#endif
+ 	strategy_ret = (*(strategy_fcn_ret_t*)bdevsw[major(bdev)].d_strategy)(bp);
+ 
+ #pragma clang diagnostic pop
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/vfs/vfs_conf.c b/bsd/vfs/vfs_conf.c
+--- a/bsd/vfs/vfs_conf.c	2026-11-23 21:31:45.162637741 +0900
++++ b/bsd/vfs/vfs_conf.c	2026-11-09 01:54:44.000000000 +0900
+@@ -110,6 +110,11 @@
+ #if HFS
+ extern  struct vfsops hfs_vfsops;
+ #endif /* HFS */
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++#define N986B_HFS_MOUNTROOT VFC_VFSCANMOUNTROOT
++#else
++#define N986B_HFS_MOUNTROOT 0
++#endif
+ 
+ #if APFS
+ extern  struct vfsops apfs_vfsops;
+@@ -246,7 +251,8 @@
+ 		.vfc_next = NULL,
+ 		.vfc_reserved1 = 0,
+ 		.vfc_reserved2 = 0,
+-		.vfc_vfsflags = VFC_VFSLOCALARGS | VFC_VFSREADDIR_EXTENDED | VFC_VFS64BITREADY | VFC_VFSVNOP_PAGEOUTV2 |
++		/* On N986B, try the existing hfs_mount(data=0) root path. */
++		.vfc_vfsflags = N986B_HFS_MOUNTROOT | VFC_VFSLOCALARGS | VFC_VFSREADDIR_EXTENDED | VFC_VFS64BITREADY | VFC_VFSVNOP_PAGEOUTV2 |
+ 		    VFC_VFSVNOP_PAGEINV2 | VFC_VFSNATIVEXATTR,
+ 		.vfc_descptr = NULL,
+ 		.vfc_descsize = 0,
+@@ -291,7 +297,12 @@
+ 		.vfc_typenum = FT_MOCKFS,
+ 		.vfc_refcount = 0,
+ 		.vfc_flags = MNT_LOCAL,
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++		/* A failed HFS mount must not masquerade as a successful mockfs boot. */
++		.vfc_mountroot = NULL,
++#else
+ 		.vfc_mountroot = mockfs_mountroot,
++#endif
+ 		.vfc_next = NULL,
+ 		.vfc_reserved1 = 0,
+ 		.vfc_reserved2 = 0,
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/bsd/vfs/vfs_subr.c b/bsd/vfs/vfs_subr.c
+--- a/bsd/vfs/vfs_subr.c	2026-11-23 21:31:45.162668645 +0900
++++ b/bsd/vfs/vfs_subr.c	2026-11-09 01:54:44.000000000 +0900
+@@ -1264,6 +1264,17 @@
+ 			error = VFS_MOUNT(mp, rootvp, 0, ctx);
+ 		}
+ 
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++		if (strcmp(vfsp->vfc_name, "hfs") == 0) {
++			char line[96];
++			extern void loader_log_line(const char *);
++			snprintf(line, sizeof(line),
++			    "B2L ROOTFS: HFS mountroot result=%d\n", error);
++			printf("%s", line);
++			loader_log_line(line);
++		}
++#endif
++
+ 		if (!error) {
+ 			if (bdevvp_rootvp != rootvp) {
+ 				/*
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/config/MASTER.arm64.exynos990 b/config/MASTER.arm64.exynos990
+--- a/config/MASTER.arm64.exynos990	1970-01-01 09:00:00.000000000 +0900
++++ b/config/MASTER.arm64.exynos990	2026-11-08 20:27:03.000000000 +0900
+@@ -0,0 +1,96 @@
++#
++# Mach Operating System
++# Copyright (c) 1986 Carnegie-Mellon University
++# Copyright 2001-2018 Apple Inc.
++#
++# All rights reserved.  The CMU software License Agreement
++# specifies the terms and conditions for use and redistribution.
++#
++######################################################################
++#
++#  Master Apple configuration file (see the master machine independent
++#  configuration file for a description of the file format).
++#
++######################################################################
++#
++#  Standard Apple OS Configurations:
++#  -------- ----- -- ---------------
++#
++#  KERNEL_BASE =    [ arm64 config_pmap_ppl xsmall msgb_small config_embedded config_requires_u32_munging nos_arm_pmap nos_arm_asm ]
++#  KERNEL_RELEASE = [ KERNEL_BASE ]
++#  KERNEL_DEV =     [ KERNEL_BASE development mach_assert config_xnupost proc_ref_debug ]
++#  KERNEL_DEBUG =   [ KERNEL_BASE debug mach_assert config_xnupost config_waitq_stats config_workloop_debug ]
++#  BSD_BASE =       [ mach_bsd psynch config_proc_uuid_policy config_personas ]
++#  BSD_RELEASE =    [ BSD_BASE no_printf_str no_kprintf_str secure_kernel ]
++#  BSD_DEV =        [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
++#  BSD_DEBUG =      [ BSD_BASE config_netboot config_imageboot config_coredump config_vnguard ]
++#  FILESYS_BASE =   [ devfs fifo fs_compression config_protect config_mnt_rootsnap config_fse routefs namedstreams bindfs mockfs ramfs apfs hfs ]
++#  FILESYS_RELEASE= [ FILESYS_BASE ]
++#  FILESYS_DEV =    [ FILESYS_BASE config_union_mounts fdesc ]
++#  FILESYS_DEBUG =  [ FILESYS_BASE config_union_mounts fdesc ]
++#  NFS_DEV =        [ nfsserver ]
++#  SKYWALK_BASE =   [ skywalk config_nexus_user_pipe config_nexus_kernel_pipe config_nexus_monitor config_nexus_flowswitch config_nexus_netif ]
++#  SKYWALK_RELEASE = [ SKYWALK_BASE ]
++#  SKYWALK_DEV =    [ SKYWALK_BASE ]
++#  SKYWALK_DEBUG =  [ SKYWALK_BASE ]
++#  NETWORKING =     [ inet bpfilter if_bridge traffic_mgt dummynet ah_all_crypto if_fake ]
++#  NETWORKING_RELEASE = [ NETWORKING ]
++#  NETWORKING_DEV = [ NETWORKING_RELEASE packet_mangler if_headless ]
++#  NETWORKING_DEBUG = [ NETWORKING_DEV ]
++#  VPN =            [ ipsec flow_divert necp content_filter ]
++#  PF =             [ pf ]
++#  MULTIPATH =      [ multipath mptcp ]
++#  IOKIT_BASE =     [ iokit iokitcpp no_kextd no_kernel_hid config_sleep ]
++#  IOKIT_RELEASE =  [ IOKIT_BASE ]
++#  IOKIT_DEV =      [ IOKIT_BASE iokitstats iotracking ]
++#  IOKIT_DEBUG =    [ IOKIT_BASE iokitstats iotracking]
++#  LIBKERN_BASE =   [ libkerncpp config_blocks config_kec_fips zlib crypto_sha2 ]
++#  LIBKERN_RELEASE =[ LIBKERN_BASE ]
++#  LIBKERN_DEV =    [ LIBKERN_BASE iotracking ]
++#  LIBKERN_DEBUG =  [ LIBKERN_BASE iotracking ]
++#  PERF_DBG_BASE =  [ mach_kdp config_serial_kdp kperf kpc ]
++#  PERF_DBG_RELEASE=[ PERF_DBG_BASE ist_kdebug ]
++#  PERF_DBG_DEV =   [ PERF_DBG_BASE config_dtrace zleaks kdp_interactive_debugging alternate_debugger config_iotrace]
++#  PERF_DBG_DEBUG = [ PERF_DBG_BASE config_dtrace zleaks kdp_interactive_debugging alternate_debugger config_iotrace]
++#  MACH_BASE =      [ mach config_ecc_logging vc_progress_white importance_inheritance config_atm config_coalitions config_iosched config_library_validation config_sysdiagnose config_telemetry config_mach_bridge_recv_time config_quiesce_counter config_service_port_info ]
++#  MACH_RELEASE =   [ MACH_BASE config_skip_precise_user_kernel_time debugger_for_zone_info ]
++#  MACH_DEV =       [ MACH_BASE config_io_accounting importance_trace ]
++#  MACH_DEBUG =     [ MACH_BASE config_io_accounting importance_trace importance_debug ]
++#  SCHED_BASE =     [ config_sched_traditional config_sched_multiq config_sched_deferred_ast config_clutch config_taskwatch ]
++#  SCHED_RELEASE =  [ SCHED_BASE ]
++#  SCHED_DEV =      [ SCHED_BASE ]
++#  SCHED_DEBUG =    [ SCHED_BASE config_sched_grrr config_sched_proto ]
++#  VM_BASE =        [ vm_pressure_events jetsam freeze memorystatus config_code_decryption phantom_cache config_secluded_memory config_cs_validation_bitmap ]
++#  VM_RELEASE =     [ VM_BASE ]
++#  VM_DEV =         [ VM_BASE dynamic_codesigning ubsan_minimal pgzalloc ]
++#  VM_DEBUG =       [ VM_BASE dynamic_codesigning ubsan_minimal pgzalloc ]
++#  VM_KASAN =       [ VM_BASE dynamic_codesigning config_kasan config_ubsan config_kcov config_ksancov kernel_tbi]
++#  SECURITY_BASE =     [ config_macf kernel_integrity config_secure_bsd_root ]
++#  SECURITY_RELEASE = [ SECURITY_BASE ]
++#  SECURITY_DEV =     [ SECURITY_BASE config_setuid config_kas_info ]
++#  SECURITY_DEBUG =   [ SECURITY_BASE config_setuid config_kas_info ]
++#  BASE =           [ MULTIPATH PF VPN ]
++#  RELEASE =        [ BASE KERNEL_RELEASE BSD_RELEASE FILESYS_RELEASE             SKYWALK_RELEASE NETWORKING_RELEASE IOKIT_RELEASE LIBKERN_RELEASE PERF_DBG_RELEASE MACH_RELEASE SCHED_RELEASE VM_RELEASE SECURITY_RELEASE HAKIOS_DRIVERS ]
++#  DEVELOPMENT =    [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     NFS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV     PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_DEV     SECURITY_DEV HAKIOS_DRIVERS     ]
++#  DEBUG =          [ BASE KERNEL_DEBUG   BSD_DEBUG   FILESYS_DEBUG               SKYWALK_DEBUG   NETWORKING_DEBUG   IOKIT_DEBUG   LIBKERN_DEBUG   PERF_DBG_DEBUG   MACH_DEBUG   SCHED_DEBUG   VM_DEBUG   SECURITY_DEBUG HAKIOS_DRIVERS   ]
++#  KASAN =          [ BASE KERNEL_DEV     BSD_DEV     FILESYS_DEV     NFS_DEV     SKYWALK_DEV     NETWORKING_DEV     IOKIT_DEV     LIBKERN_DEV     PERF_DBG_DEV     MACH_DEV     SCHED_DEV     VM_KASAN   SECURITY_DEV HAKIOS_DRIVERS     ]
++#
++######################################################################
++#
++machine		"arm64"						# <arm64>
++
++makeoptions	OSFMK_MACHINE = "arm64"				# <mach>
++
++options		COUNT_SYSCALLS		# count bsd system calls 	# <countcalls>
++options     TRASH_VFP_ON_SAVE   # <debug,trash_vfp>
++options		ALTERNATE_DEBUGGER	# <alternate_debugger>
++
++options   CONFIG_VNODES=1024		# <xsmall>
++
++options   CONFIG_FREEZE_SUSPENDED_MIN=4		# <xsmall>
++
++options	  CONFIG_MACH_APPROXIMATE_TIME
++
++options   CONFIG_KERNEL_INTEGRITY		# <kernel_integrity>
++options   CONFIG_UBSAN_MINIMAL		# <ubsan_minimal>
++options   CONFIG_KERNEL_TBI	# <kernel_tbi>
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/iokit/bsddev/IOKitBSDInit.cpp b/iokit/bsddev/IOKitBSDInit.cpp
+--- a/iokit/bsddev/IOKitBSDInit.cpp	2026-11-23 21:31:45.740559209 +0900
++++ b/iokit/bsddev/IOKitBSDInit.cpp	2026-11-09 15:19:16.217393083 +0900
+@@ -35,9 +35,16 @@
+ #include <IOKit/IOPlatformExpert.h>
+ #include <IOKit/IOUserClient.h>
+ #include <libkern/c++/OSAllocation.h>
++#include <libkern/crypto/sha2.h>
++extern "C" {
++#include "../../bsd/b2l_ro_device.h"
++int b2l_ro_store_xnu_register_verified(const struct b2l_ro_proof *proof);
++}
++#include <machine/machine_routines.h>
+ 
+ extern "C" {
+ #include <libkern/amfi/amfi.h>
++#include <sys/systm.h>
+ #include <sys/codesign.h>
+ #include <sys/code_signing.h>
+ #include <vm/pmap.h>
+@@ -651,6 +658,266 @@
+ 	return true;
+ }
+ 
++#if defined(__arm64__)
++extern "C" boolean_t pmap_valid_address(uint64_t addr);
++extern "C" void loader_log_line(const char *line);
++extern "C" void platform_cache_clean(void);
++
++/*
++ * Host-built H4 diagnostic block device; root and handoff remain unchanged.
++ * A v3 same-run receipt, the independently pinned full physical digest,
++ * and a bounded bcopy_phys edge read all precede devfs registration.
++ */
++static const uint8_t b2l_h4_expected_sha256[32] = {
++    0xb2, 0x6a, 0x12, 0x94, 0x9f, 0xe1, 0xce, 0x56,
++    0xf5, 0x83, 0x0a, 0x71, 0x87, 0xa2, 0x8b, 0xbf,
++    0x4b, 0x17, 0x33, 0x62, 0xa7, 0xd0, 0xbe, 0x0c,
++    0x08, 0x2e, 0x84, 0xe7, 0x00, 0x79, 0x5d, 0x8a
++};
++
++static uint16_t
++b2l_h1_le16(const uint8_t *p)
++{
++    return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
++}
++
++static uint32_t
++b2l_h1_le32(const uint8_t *p)
++{
++    return (uint32_t)b2l_h1_le16(p) | ((uint32_t)b2l_h1_le16(p + 2) << 16);
++}
++
++static uint64_t
++b2l_h1_le64(const uint8_t *p)
++{
++    return (uint64_t)b2l_h1_le32(p) | ((uint64_t)b2l_h1_le32(p + 4) << 32);
++}
++
++static void
++b2l_h4_log(const char *message)
++{
++    /* loader_log_line is the log that the Upload A/B reader actually captures. */
++    loader_log_line(message);
++    printf("%s", message);
++}
++
++
++/* The low manifest is v3; its 80-byte /chosen RO record remains ABI v1.
++ * This function checks the live manifest against the live DT, and the UEFI
++ * post-reservation/prebranch receipts against the same manifest and nonce.
++ * It does not infer ownership from a DT assertion by itself. */
++static uint8_t
++b2l_h4_phys_byte(uint64_t pa)
++{
++    uint64_t value = ml_phys_read_double_64(pa & ~7ULL);
++    return (uint8_t)(value >> ((pa & 7ULL) * 8));
++}
++
++static bool
++b2l_h4_phys_equals(uint64_t pa, const uint8_t *expected, unsigned length)
++{
++    for (unsigned i = 0; i < length; ++i) {
++        if (b2l_h4_phys_byte(pa + i) != expected[i]) return false;
++    }
++    return true;
++}
++
++static void
++b2l_h4_phys_sha256(uint64_t pa, unsigned length, uint8_t digest[32])
++{
++    SHA256_CTX ctx;
++    uint8_t lane[8];
++    SHA256_Init(&ctx);
++    for (unsigned offset = 0; offset < length; offset += 8) {
++        uint64_t value = ml_phys_read_double_64(pa + offset);
++        for (unsigned j = 0; j < 8; ++j) lane[j] = (uint8_t)(value >> (j * 8));
++        SHA256_Update(&ctx, lane, 8);
++    }
++    SHA256_Final(digest, &ctx);
++}
++
++static bool
++b2l_h4_verify_v3_receipt(const uint8_t dt_record[80], uint64_t tag)
++{
++    static const uint8_t manifest_magic[8] = { 'N','9','8','6','B','X','N','U' };
++    static const uint8_t snapshot_magic[8] = { 'N','9','8','6','B','X','H','S' };
++    const uint64_t manifest = 0x90700000ULL;
++    const uint64_t marker = 0x95e00000ULL;
++    const uint64_t snapshot = 0x95d00000ULL;
++    uint8_t manifest_sha[32];
++    if (!b2l_h4_phys_equals(manifest, manifest_magic, 8) ||
++        ml_phys_read_double_64(manifest + 8) != ((uint64_t)4096 << 32 | 3) ||
++        !b2l_h4_phys_equals(manifest + 380, dt_record, 80) ||
++        !b2l_h4_phys_equals(snapshot, snapshot_magic, 8) ||
++        ml_phys_read_double_64(snapshot + 8) != ((uint64_t)856 << 32 | 3) ||
++        ml_phys_read_double_64(snapshot + 16) != 0x30 ||
++        ml_phys_read_double_64(snapshot + 24) != 0 ||
++        ml_phys_read_double_64(marker + 0x860) != 11 ||
++        ml_phys_read_double_64(marker + 0x910) != 0x986b0011ULL ||
++        ml_phys_read_double_64(marker + 0x918) != 0x986b1650ULL ||
++        ml_phys_read_double_64(marker + 0x920) != 0x940000000ULL ||
++        ml_phys_read_double_64(marker + 0x928) != 0xa0000000ULL ||
++        ml_phys_read_double_64(marker + 0x930) != 1 ||
++        ml_phys_read_double_64(marker + 0x938) != 1 ||
++        ml_phys_read_double_64(marker + 0x940) != tag ||
++        ml_phys_read_double_64(marker + 0x968) != 1 ||
++        !b2l_h4_phys_equals(marker + 0x948, b2l_h4_expected_sha256, 32)) {
++        return false;
++    }
++    b2l_h4_phys_sha256(manifest, 4096, manifest_sha);
++    return b2l_h4_phys_equals(marker + 0x8f0, manifest_sha, 32) &&
++           b2l_h4_phys_equals(snapshot + 824, manifest_sha, 32);
++}
++
++static void
++b2l_h4_probe_high_1mib(void)
++{
++    static bool once = false;
++    static const uint8_t magic[8] = { 'B', '2', 'L', 'R', 'O', 'V', '1', 0 };
++    static const char hexdigits[] = "0123456789abcdef";
++    const uint64_t base = 0x940000000ULL;
++    const uint64_t scratch = 0x940100000ULL;
++    const uint64_t commit_magic = 0x31304d34484c3242ULL; /* B2LH4M01 */
++    IORegistryEntry *chosen;
++    OSData *record;
++    const uint8_t *wire;
++    uint64_t tag;
++    uint8_t read_digest[32];
++    uint8_t lane[8];
++    char digest_hex[65];
++    char line[192];
++    SHA256_CTX ctx;
++    struct b2l_ro_proof proof;
++    int register_error;
++
++    if (once) {
++        return;
++    }
++    once = true;
++    b2l_h4_log("B2L-H4-ENTER\n");
++    chosen = IORegistryEntry::fromPath("/chosen", gIODTPlane);
++    if (!chosen) {
++        b2l_h4_log("B2L-H4-ABSENT chosen\n");
++        return;
++    }
++    record = OSDynamicCast(OSData, chosen->getProperty("b2l,ro-store-v1"));
++    if (!record || record->getLength() != 80) {
++        b2l_h4_log("B2L-H4-ABSENT record\n");
++        chosen->release();
++        return;
++    }
++    wire = (const uint8_t *)record->getBytesNoCopy();
++    tag = b2l_h1_le64(wire + 72);
++    if (memcmp(wire, magic, sizeof(magic)) != 0 ||
++        b2l_h1_le16(wire + 8) != 1 ||
++        b2l_h1_le16(wire + 10) != 80 ||
++        b2l_h1_le32(wire + 12) != 3 ||
++        b2l_h1_le64(wire + 16) != base ||
++        b2l_h1_le64(wire + 24) != 0x100000ULL ||
++        b2l_h1_le32(wire + 32) != 512 ||
++        b2l_h1_le32(wire + 36) != 2 ||
++        tag == 0 ||
++        memcmp(wire + 40, b2l_h4_expected_sha256, 32) != 0 ||
++        pmap_valid_address(base) ||
++        pmap_valid_address(base + 0xfffff) ||
++        pmap_valid_address(scratch) ||
++        pmap_valid_address(scratch + 4095)) {
++        b2l_h4_log("B2L-H4-REJECT identity-or-ownership\n");
++        chosen->release();
++        return;
++    }
++    if (!b2l_h4_verify_v3_receipt(wire, tag)) {
++        b2l_h4_log("B2L-H4-REJECT v3-receipt-or-dt\n");
++        chosen->release();
++        return;
++    }
++    chosen->release();
++    b2l_h4_log("B2L-H4-V3-RECEIPT-PASS\n");
++    snprintf(line, sizeof(line), "B2L-H4-RECORD-OK tag=%llx\n",
++        (unsigned long long)tag);
++    b2l_h4_log(line);
++
++    /* Exactly 131072 aligned reads cover the 1 MiB diagnostic interval. */
++    b2l_h4_log("B2L-H4-PHYS-READ-BEGIN\n");
++    SHA256_Init(&ctx);
++    for (unsigned i = 0; i < 131072; ++i) {
++        uint64_t value = ml_phys_read_double_64(base + ((uint64_t)i * 8));
++        for (unsigned j = 0; j < sizeof(lane); ++j) {
++            lane[j] = (uint8_t)(value >> (j * 8));
++        }
++        SHA256_Update(&ctx, lane, sizeof(lane));
++    }
++    SHA256_Final(read_digest, &ctx);
++    if (memcmp(read_digest, b2l_h4_expected_sha256, 32) != 0) {
++        snprintf(line, sizeof(line), "B2L-H4-REJECT physical-sha256 tag=%llx\n",
++            (unsigned long long)tag);
++        b2l_h4_log(line);
++        return;
++    }
++    b2l_h4_log("B2L-H4-PHYS-READ-SHA-OK\n");
++
++    /* The second page is in the UEFI-reserved store and never touches the
++     * witness. Commit magic last, after the computed digest reaches PoC. */
++    ml_phys_write_double_64(scratch + 0x08, 1);
++    ml_phys_write_double_64(scratch + 0x10, 1);
++    ml_phys_write_double_64(scratch + 0x18, base);
++    ml_phys_write_double_64(scratch + 0x20, 1048576ULL);
++    ml_phys_write_double_64(scratch + 0x28, tag);
++    for (unsigned i = 0; i < 4; ++i) {
++        ml_phys_write_double_64(scratch + 0x30 + i * 8,
++            b2l_h1_le64(read_digest + i * 8));
++    }
++    ml_phys_write_double_64(scratch + 0x50, ~tag);
++    ml_phys_write_double_64(scratch + 0x58, 0x986b03b1ULL);
++    platform_cache_clean();
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (ml_phys_read_double_64(scratch + 0x08) != 1 ||
++        ml_phys_read_double_64(scratch + 0x10) != 1 ||
++        ml_phys_read_double_64(scratch + 0x18) != base ||
++        ml_phys_read_double_64(scratch + 0x20) != 1048576ULL ||
++        ml_phys_read_double_64(scratch + 0x28) != tag ||
++        ml_phys_read_double_64(scratch + 0x50) != ~tag ||
++        ml_phys_read_double_64(scratch + 0x58) != 0x986b03b1ULL) {
++        b2l_h4_log("B2L-H4-REJECT scratch-readback\n");
++        return;
++    }
++    for (unsigned i = 0; i < 4; ++i) {
++        if (ml_phys_read_double_64(scratch + 0x30 + i * 8) !=
++            b2l_h1_le64(read_digest + i * 8)) {
++            b2l_h4_log("B2L-H4-REJECT digest-readback\n");
++            return;
++        }
++    }
++    ml_phys_write_double_64(scratch, commit_magic);
++    platform_cache_clean();
++    __asm__ volatile("dsb sy" ::: "memory");
++    if (ml_phys_read_double_64(scratch) != commit_magic) {
++        b2l_h4_log("B2L-H4-REJECT commit-readback\n");
++        return;
++    }
++    for (unsigned i = 0; i < sizeof(read_digest); ++i) {
++        digest_hex[2 * i] = hexdigits[read_digest[i] >> 4];
++        digest_hex[2 * i + 1] = hexdigits[read_digest[i] & 15];
++    }
++    digest_hex[64] = 0;
++    snprintf(line, sizeof(line),
++        "B2L-H4-1MIB-PASS tag=%llx sha256=%s bytes=1048576 scratch=0x940100000\n",
++        (unsigned long long)tag, digest_hex);
++    b2l_h4_log(line);
++    proof.observed_reservation_tag = tag;
++    memcpy(proof.observed_image_sha256, read_digest, 32);
++    proof.efi_reserved_owner_confirmed = 1;
++    proof.read_only_copy_window_confirmed = 1;
++    register_error = b2l_ro_store_xnu_register_verified(&proof);
++    if (register_error) {
++        snprintf(line, sizeof(line), "B2L-H4-REGISTER-REJECT errno=%d\n", register_error);
++        b2l_h4_log(line);
++        return;
++    }
++    b2l_h4_log("B2L-H4-NO-ROOT-ALIAS /dev/b2lro0\n");
++}
++#endif /* __arm64__ */
++
+ kern_return_t
+ IOFindBSDRoot( char * rootName, unsigned int rootNameSize,
+     dev_t * root, u_int32_t * oflags )
+@@ -699,6 +966,10 @@
+ 	matching->release();
+ 	matching = NULL;
+ 
++#if defined(__arm64__)
++	b2l_h4_probe_high_1mib();
++#endif
++
+ 	if (mountAttempts++) {
+ 		IOLog("mount(%d) failed\n", mountAttempts);
+ 		IOSleep( 5 * 1000 );
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/makedefs/MakeInc.def b/makedefs/MakeInc.def
+--- a/makedefs/MakeInc.def	2026-11-23 21:31:45.163167165 +0900
++++ b/makedefs/MakeInc.def	2026-11-08 20:27:03.000000000 +0900
+@@ -29,7 +29,7 @@
+ else ifneq ($(findstring _host,$(RC_ProjectName)),)
+ SUPPORTED_ARM64_MACHINE_CONFIGS = NONE
+ else
+-SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 T6000 T8101 T8103 VMAPPLE
++SUPPORTED_ARM64_MACHINE_CONFIGS = BCM2837 EXYNOS990 T6000 T8101 T8103 VMAPPLE
+ 
+ endif
+ 
+@@ -61,6 +61,7 @@
+ MACHINE_FLAGS_ARM64_T6000 = -DARM64_BOARD_CONFIG_T6000 		-mcpu=apple-a14
+ MACHINE_FLAGS_ARM64_VMAPPLE = -DARM64_BOARD_CONFIG_VMAPPLE              -march=armv8.5a
+ MACHINE_FLAGS_ARM64_BCM2837 = -DARM64_BOARD_CONFIG_BCM2837 -Xclang -target-feature -Xclang +pan
++MACHINE_FLAGS_ARM64_EXYNOS990 = -DARM64_BOARD_CONFIG_EXYNOS990 -Xclang -target-feature -Xclang +pan
+ 
+ 
+ #
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/arm/arm_init.c b/osfmk/arm/arm_init.c
+--- a/osfmk/arm/arm_init.c	2026-11-23 21:31:45.751053196 +0900
++++ b/osfmk/arm/arm_init.c	2026-11-08 21:13:02.000000000 +0900
+@@ -508,16 +508,23 @@
+ 		/*
+ 		 * Select the advertised kernel page size.
+ 		 */
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++		/* Host candidate: advertise 16 KiB VM pages for the exact N986B
++		 * 960 MiB handoff. Hardware ARM_PGSHIFT remains 12 (4 KiB).
++		 * Runtime memory and user-space safety are not established here. */
++		if (args->memSize > 1ULL * 1024 * 1024 * 1024 ||
++		    args->memSize == 0x3c000000ULL) {
++#else
+ 		if (args->memSize > 1ULL * 1024 * 1024 * 1024) {
++#endif
+ 			/*
+-			 * arm64 device with > 1GB of RAM:
+-			 * kernel uses 16KB pages.
++			 * Advertise 16 KiB VM pages. The EXYNOS990 960 MiB host
++			 * candidate is an exception to the usual >1 GiB rule.
+ 			 */
+ 			PAGE_SHIFT_CONST = PAGE_MAX_SHIFT;
+ 		} else {
+ 			/*
+-			 * arm64 device with <= 1GB of RAM:
+-			 * kernel uses hardware page size
++			 * Otherwise, advertise the hardware page size
+ 			 * (4KB for H6/H7, 16KB for H8+).
+ 			 */
+ 			PAGE_SHIFT_CONST = ARM_PGSHIFT;
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/arm64/gic_v3_irq.c b/osfmk/arm64/gic_v3_irq.c
+--- a/osfmk/arm64/gic_v3_irq.c	2026-11-08 19:54:21.276494200 +0900
++++ b/osfmk/arm64/gic_v3_irq.c	2026-11-08 20:56:16.000000000 +0900
+@@ -670,10 +670,19 @@
+ 		vm_offset_t soc_base = pe_arm_get_soc_base_phys();
+ 
+ 		simple_lock_init(&gic_spi_lock, 0);
+-		gic_v2 = SecureDTGetProperty(entry, "compatible", &prop, &prop_size) == kSuccess &&
+-		    strncmp(prop, "arm,gic-400", prop_size) == 0;
++		/* N986B describes its GICv2 CPU interface as Cortex-A15 GIC. */
++		bool const has_compatible = SecureDTGetProperty(entry, "compatible", &prop, &prop_size) == kSuccess;
++		gic_v2 = has_compatible &&
++		    ((prop_size >= sizeof("arm,gic-400") &&
++		    strncmp(prop, "arm,gic-400", sizeof("arm,gic-400")) == 0) ||
++		    (prop_size >= sizeof("arm,cortex-a15-gic") &&
++		    strncmp(prop, "arm,cortex-a15-gic", sizeof("arm,cortex-a15-gic")) == 0));
+ 		gicd_base = ml_io_map(soc_base + reg[0], reg[1]);
+ 		if (gic_v2) {
++			/* GICC accesses below stay within the measured 0x1000-byte window. */
++			if (reg[3] < 0x1000) {
++				panic("gic: GICv2 CPU interface window is smaller than 0x1000");
++			}
+ 			gicc_base = ml_io_map(soc_base + reg[2], reg[3]);
+ 		} else {
+ 			gicr_base = ml_io_map(soc_base + reg[2], reg[3]);
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/arm64/loader_return.c b/osfmk/arm64/loader_return.c
+--- a/osfmk/arm64/loader_return.c	2026-11-08 19:54:21.277493900 +0900
++++ b/osfmk/arm64/loader_return.c	2026-11-09 01:14:47.000000000 +0900
+@@ -97,6 +97,9 @@
+ static uint32_t loader_log_lock;
+ 
+ static void loader_log_put_locked(char c);
++static void n986b_flush_loader_log(void);
++static void n986b_flush_msgbuf(void);
++static uint32_t n986b_log_flushed_len;
+ 
+ /*
+  * A second reader of every character the log gets, as it gets it: the USB gadget driver's (drivers/usb/hakios.dwc3.c),
+@@ -150,6 +153,9 @@
+ 		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+ 	}
+ 	loader_log_put_locked(c);
++	if (c == '\n') {
++		n986b_flush_loader_log();
++	}
+ 	if (locked) {
+ 		os_atomic_store(&loader_log_lock, 0, release);
+ 	}
+@@ -173,11 +179,16 @@
+ 	for (uint32_t tries = 0; !locked && tries < 10000000; tries++) {
+ 		locked = os_atomic_cmpxchg(&loader_log_lock, 0, 1, acquire);
+ 	}
++	bool complete_line = false;
+ 	for (; *line != 0; line++) {
+ 		if (*line != '\r') {
+ 			loader_log_put_locked(*line);
++			complete_line |= *line == '\n';
+ 		}
+ 	}
++	if (complete_line) {
++		n986b_flush_loader_log();
++	}
+ 	if (locked) {
+ 		os_atomic_store(&loader_log_lock, 0, release);
+ 	}
+@@ -408,6 +419,54 @@
+ };
+ extern struct msgbuf *msgbufp;
+ 
++/* Keep a bounded diagnostic copy visible to S-Boot Upload after a CPU reset.
++ * Cache clean is ordered before the length and heartbeat metadata.
++ * The fast path only touches bytes added since its prior clean; after a
++ * ring wrap, a full bounded clean keeps the debug path simple.
++ */
++static void
++n986b_clean_range(const void *address, uint32_t size)
++{
++	uintptr_t first = (uintptr_t)address & ~(uintptr_t)63;
++	uintptr_t end = (uintptr_t)address + size;
++	for (uintptr_t p = first; p < end; p += 64) {
++		__asm__ volatile ("dc cvac, %0" : : "r" (p) : "memory");
++	}
++}
++
++static void
++n986b_flush_loader_log(void)
++{
++	uint32_t len = loader_log_len;
++	if (len > LOADER_LOG_SIZE) {
++		return;
++	}
++	if (!loader_log_wrapped && len >= n986b_log_flushed_len) {
++		n986b_clean_range(loader_log + n986b_log_flushed_len,
++		    len - n986b_log_flushed_len);
++	} else {
++		n986b_clean_range(loader_log, len);
++	}
++	n986b_log_flushed_len = len;
++	n986b_clean_range(&loader_log_len, sizeof(loader_log_len));
++	n986b_clean_range(&loader_live.heartbeat, sizeof(loader_live.heartbeat));
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
++static void
++n986b_flush_msgbuf(void)
++{
++	struct msgbuf *mb = msgbufp;
++	if (mb == NULL || mb->msg_bufc == NULL || mb->msg_size <= 0 ||
++	    mb->msg_size > 256 * 1024 || mb->msg_bufx < 0 ||
++	    mb->msg_bufx > mb->msg_size) {
++		return;
++	}
++	n986b_clean_range(mb->msg_bufc, (uint32_t)mb->msg_size);
++	n986b_clean_range(mb, sizeof(*mb));
++	__asm__ volatile ("dsb sy" : : : "memory");
++}
++
+ static void
+ loader_log_hex(uint64_t v)
+ {
+@@ -525,6 +584,8 @@
+ 		fp = next;
+ 	}
+ 	loader_log_puts("---\n");
++	n986b_flush_loader_log();
++	n986b_flush_msgbuf();
+ }
+ 
+ /* early_log: right after ml_parse_cpu_topology(), what the kernel will match each processor's MPIDR against */
+@@ -708,6 +769,113 @@
+ 	loader_exit_without_loader();
+ }
+ 
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++/* This define exists only in the isolated N986B ATE3 RAM experiment.
++ * The pinned UEFI loader does not yet pass b2l_panic_upload=1. A boot argument
++ * with value 0 disables it without changing the loader. No other board gets
++ * this default. Remove the define after a loader with an explicit opt-in is
++ * available. */
++#define N986B_AUTO_UPLOAD_TEST_BUILD 1
++
++#define N986B_PMU_PA              0x15860000UL
++#define N986B_PMU_SIZE            0x4000UL
++#define N986B_PMU_INFORM3         0x080cUL
++#define N986B_PMU_SWRESET         0x3a00UL
++#define N986B_UPLOAD_MAGIC        0x0000ece9U
++#define N986B_SOFTWARE_RESET      2U
++
++static vm_offset_t n986b_auto_upload_pmu;
++static uint32_t n986b_auto_upload_enabled;
++static uint32_t n986b_auto_upload_attempted;
++
++__startup_func
++static void
++n986b_auto_upload_init(void)
++{
++	uint32_t requested = N986B_AUTO_UPLOAD_TEST_BUILD;
++
++	(void)PE_parse_boot_argn("b2l_panic_upload", &requested, sizeof(requested));
++	if (requested != 1 || loader_stub_slot[1] != 0) {
++		return;
++	}
++	n986b_auto_upload_pmu = ml_io_map(N986B_PMU_PA, N986B_PMU_SIZE);
++	if (n986b_auto_upload_pmu != 0) {
++		/* Read-only EL1 access check before the panic path. A fault here is a
++		 * boot-time mapping failure, not evidence of an upload attempt. */
++		uint32_t inform3 = *(volatile uint32_t *)(n986b_auto_upload_pmu + N986B_PMU_INFORM3);
++		loader_log_puts("N986B AUTO UPLOAD: PMU mapped VA ");
++		loader_log_hex(n986b_auto_upload_pmu);
++		loader_log_puts(" INFORM3 ");
++		loader_log_hex(inform3);
++		loader_log_putc('\n');
++		n986b_auto_upload_enabled = 1;
++	}
++}
++STARTUP(EARLY_BOOT, STARTUP_RANK_LAST, n986b_auto_upload_init);
++
++/* Called after the ordinary panic text has been emitted. No allocation, map,
++ * I/O lock, storage call, PSCI request or loader_return on this path. The
++ * single 16 KiB PMU mapping covers both INFORM3 and SWRESET. */
++void
++n986b_panic_auto_upload(void)
++{
++	volatile uint32_t *inform3;
++	volatile uint32_t *swreset;
++	uint32_t prior;
++
++	if (!n986b_auto_upload_enabled || n986b_auto_upload_pmu == 0 ||
++	    loader_stub_slot[1] != 0 ||
++	    (__builtin_arm_rsr64("MPIDR_EL1") & 0xffffffUL) != 0 ||
++	    __atomic_exchange_n(&n986b_auto_upload_attempted, 1, __ATOMIC_ACQ_REL) != 0) {
++		return;
++	}
++
++	/* Keep the same bounded log collection used by loader_return(), and make
++	 * the final bytes visible to the next S-Boot instance before reset. */
++	if (debug_buf_base != NULL && debug_buf_ptr > debug_buf_base &&
++	    (size_t)(debug_buf_ptr - debug_buf_base) < 256 * 1024) {
++		loader_log_puts("\n--- panic buffer before auto upload ---\n");
++		for (const char *c = debug_buf_base; c < debug_buf_ptr; c++) {
++			loader_log_putc(*c);
++		}
++	}
++	loader_log_puts("\nN986B AUTO UPLOAD: ATE3 DINFORM ECE9, SWRESET 2\n");
++	n986b_flush_msgbuf();
++	n986b_flush_loader_log();
++
++	inform3 = (volatile uint32_t *)(n986b_auto_upload_pmu + N986B_PMU_INFORM3);
++	swreset = (volatile uint32_t *)(n986b_auto_upload_pmu + N986B_PMU_SWRESET);
++	prior = *inform3;
++	*inform3 = N986B_UPLOAD_MAGIC;
++	__asm__ volatile ("dsb sy" : : : "memory");
++	if (*inform3 != N986B_UPLOAD_MAGIC) {
++		*inform3 = prior;
++		__asm__ volatile ("dsb sy" : : : "memory");
++		return;
++	}
++	*swreset = N986B_SOFTWARE_RESET;
++	__asm__ volatile ("dsb sy" : : : "memory");
++	/* The reset should occur immediately. Keep the original panic path if
++	 * hardware does not reset within three counter seconds. Do not use WFE:
++	 * a missing interrupt could leave this loop asleep forever. */
++	uint64_t started = __builtin_arm_rsr64("CNTVCT_EL0");
++	uint64_t frequency = __builtin_arm_rsr64("CNTFRQ_EL0");
++	/* Some Exynos boot paths leave CNTFRQ_EL0 unset. Keep a bounded wait
++	 * using the 26 MHz architectural timer frequency from the board DTS. */
++	if (frequency < 1000000 || frequency > 1000000000) {
++		frequency = 26000000;
++	}
++	uint64_t timeout = frequency * 3;
++	while (__builtin_arm_rsr64("CNTVCT_EL0") - started < timeout) {
++		__asm__ volatile ("yield" : : : "memory");
++	}
++	*inform3 = prior;
++	__asm__ volatile ("dsb sy" : : : "memory");
++	loader_log_puts("N986B AUTO UPLOAD: reset timeout; original panic path\n");
++	n986b_flush_loader_log();
++}
++#endif /* ARM64_BOARD_CONFIG_EXYNOS990 */
++
+ /*
+  * Bring-up aid: stop here if the loader asked for checkpoint n. Every checkpoint passed is also written to the log the
+  * loader gets back ("[c10][c11]..."), so a kernel that ends before its first line still says how far it came.
+@@ -906,6 +1074,8 @@
+ 	if (++loader_live.heartbeat % MEMORY_REPORT_BEATS == 0) {
+ 		memory_report();
+ 	}
++	n986b_flush_loader_log();
++	n986b_flush_msgbuf();
+ 
+ 	clock_interval_to_deadline(HV_WDT_PET_SECONDS, NSEC_PER_SEC, &deadline);
+ 	thread_call_enter_delayed(hv_wdt_call, deadline);
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/arm64/proc_reg.h b/osfmk/arm64/proc_reg.h
+--- a/osfmk/arm64/proc_reg.h	2026-11-23 21:31:45.027991941 +0900
++++ b/osfmk/arm64/proc_reg.h	2026-11-08 20:27:03.000000000 +0900
+@@ -205,7 +205,7 @@
+ /* D-Cache, 160KB for Firestorm, 8-way. 64KB for Icestorm, 6-way. */
+ #define MMU_CLINE   6                      /* cache line size is 1<<MMU_CLINE (64) */
+ 
+-#elif defined (BCM2837) /* Raspberry Pi 3 */
++#elif defined (BCM2837) || defined(EXYNOS990) /* generic ARMv8 cores */
+ 
+ /* I-Cache. We don't have detailed spec so we just follow the ARM technical reference. */
+ #define MMU_I_CLINE 6
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/arm64/sleh.c b/osfmk/arm64/sleh.c
+--- a/osfmk/arm64/sleh.c	2026-11-23 21:31:45.751086595 +0900
++++ b/osfmk/arm64/sleh.c	2026-11-09 02:15:51.874737818 +0900
+@@ -1232,6 +1232,20 @@
+ 		panic_with_thread_kernel_state("SP alignment exception from kernel.", ss);
+ 	}
+ 
++#if defined(ARM64_BOARD_CONFIG_EXYNOS990)
++	{
++		char line[160];
++		extern void loader_log_line(const char *);
++		snprintf(line, sizeof(line),
++		    "B2L SPFAULT: pc=0x%llx sp=0x%llx mod16=%llu esr=0x%llx\n",
++		    (unsigned long long)get_saved_state_pc(ss),
++		    (unsigned long long)get_saved_state_sp(ss),
++		    (unsigned long long)(get_saved_state_sp(ss) & 15),
++		    (unsigned long long)__builtin_arm_rsr64("ESR_EL1"));
++		loader_log_line(line);
++	}
++#endif
++
+ 	exc = EXC_BAD_ACCESS;
+ #if __has_feature(ptrauth_calls)
+ 	if (user_fault_addr_matches_pac_error_code(get_saved_state_sp(ss), true)) {
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/console/video_console.c b/osfmk/console/video_console.c
+--- a/osfmk/console/video_console.c	2026-11-23 21:31:45.163411756 +0900
++++ b/osfmk/console/video_console.c	2026-11-08 20:27:03.000000000 +0900
+@@ -2855,7 +2855,7 @@
+ 			gc_acquired = TRUE;
+ 		} else {
+ 			if (makeMapping) {
+-#if HAS_UCNORMAL_MEM || defined(BCM2837)
++#if HAS_UCNORMAL_MEM || defined(BCM2837) || defined(EXYNOS990)
+ 				/*
+ 				 * (Generic ARM boards too: scrolling reads the framebuffer
+ 				 * back, and as device memory that is one bus access per
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/kern/debug.c b/osfmk/kern/debug.c
+--- a/osfmk/kern/debug.c	2026-11-23 21:31:45.743019424 +0900
++++ b/osfmk/kern/debug.c	2026-11-09 01:02:20.000000000 +0900
+@@ -1157,10 +1157,20 @@
+ }
+ 
+ extern void loader_return(void);
++#if defined(__arm64__)
++/* A separate Exynos 990 experiment supplies this symbol; other boards retain
++ * their original panic path. */
++extern void n986b_panic_auto_upload(void) __attribute__((weak));
++#endif
+ 
+ void
+ panic_spin_forever(void)
+ {
++#if defined(__arm64__)
++	if (n986b_panic_auto_upload != NULL) {
++		n986b_panic_auto_upload();
++	}
++#endif
+ 	loader_return();
+ 	for (;;) {
+ #if defined(__arm__) || defined(__arm64__)
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/osfmk/kern/startup.c b/osfmk/kern/startup.c
+--- a/osfmk/kern/startup.c	2026-11-23 21:31:45.163614818 +0900
++++ b/osfmk/kern/startup.c	2026-11-08 20:27:03.000000000 +0900
+@@ -738,7 +738,7 @@
+ 	csm_initialize_provisioning_profiles();
+ #endif
+ 
+-#ifndef BCM2837
++#if !defined(BCM2837) && !defined(EXYNOS990)
+ 	kernel_bootstrap_log("trust_cache_init");
+ 
+ 	/* Initialize the runtime for the trust cache interface */
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/pexpert/arm/pe_identify_machine.c b/pexpert/arm/pe_identify_machine.c
+--- a/pexpert/arm/pe_identify_machine.c	2026-11-23 21:31:45.096198953 +0900
++++ b/pexpert/arm/pe_identify_machine.c	2026-11-08 20:56:16.000000000 +0900
+@@ -64,10 +64,13 @@
+ 	/* Clear the gPEClockFrequencyInfo struct */
+ 	bzero((void *)&gPEClockFrequencyInfo, sizeof(clock_frequency_info_t));
+ 
+-	/* Start with default values. */
++	/* Provisional generic-DT fallbacks, not measured N986B clock rates. */
+ 	gPEClockFrequencyInfo.timebase_frequency_hz = 24000000;
++	gPEClockFrequencyInfo.dec_clock_rate_hz = gPEClockFrequencyInfo.timebase_frequency_hz;
+ 	gPEClockFrequencyInfo.bus_clock_rate_hz = 100000000;
++	gPEClockFrequencyInfo.bus_frequency_hz = gPEClockFrequencyInfo.bus_clock_rate_hz;
+ 	gPEClockFrequencyInfo.cpu_clock_rate_hz = 400000000;
++	gPEClockFrequencyInfo.cpu_frequency_hz = gPEClockFrequencyInfo.cpu_clock_rate_hz;
+ 
+ 	err = SecureDTLookupEntry(NULL, "/cpus", &cpus);
+ 	assert(err == kSuccess);
+@@ -94,6 +97,9 @@
+ 				gPEClockFrequencyInfo.timebase_frequency_hz = *(uint32_t const *)value;
+ 			}
+ 		}
++		if (gPEClockFrequencyInfo.timebase_frequency_hz == 0) {
++			gPEClockFrequencyInfo.timebase_frequency_hz = 24000000;
++		}
+ 		gPEClockFrequencyInfo.dec_clock_rate_hz = gPEClockFrequencyInfo.timebase_frequency_hz;
+ 
+ 		/* Find the bus frequency next. */
+@@ -104,6 +110,10 @@
+ 				gPEClockFrequencyInfo.bus_frequency_hz = *(uint32_t const *)value;
+ 			}
+ 		}
++		if (gPEClockFrequencyInfo.bus_frequency_hz == 0) {
++			/* Missing/zero DT value: retain the provisional nonzero floor. */
++			gPEClockFrequencyInfo.bus_frequency_hz = 100000000;
++		}
+ 		gPEClockFrequencyInfo.bus_frequency_min_hz = gPEClockFrequencyInfo.bus_frequency_hz;
+ 		gPEClockFrequencyInfo.bus_frequency_max_hz = gPEClockFrequencyInfo.bus_frequency_hz;
+ 
+@@ -151,6 +161,10 @@
+ 				gPEClockFrequencyInfo.cpu_frequency_hz = *(uint32_t const *)value;
+ 			}
+ 		}
++		if (gPEClockFrequencyInfo.cpu_frequency_hz == 0) {
++			/* Missing/zero DT value: retain the provisional nonzero floor. */
++			gPEClockFrequencyInfo.cpu_frequency_hz = 400000000;
++		}
+ 		gPEClockFrequencyInfo.cpu_frequency_min_hz = gPEClockFrequencyInfo.cpu_frequency_hz;
+ 		gPEClockFrequencyInfo.cpu_frequency_max_hz = gPEClockFrequencyInfo.cpu_frequency_hz;
+ 
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/pexpert/pexpert/arm64/EXYNOS990.h b/pexpert/pexpert/arm64/EXYNOS990.h
+--- a/pexpert/pexpert/arm64/EXYNOS990.h	1970-01-01 09:00:00.000000000 +0900
++++ b/pexpert/pexpert/arm64/EXYNOS990.h	2026-11-08 20:27:03.000000000 +0900
+@@ -0,0 +1,18 @@
++/* Compile-only Exynos 990 board target; runtime addresses and boot contract need validation. */
++#ifndef _PEXPERT_ARM_EXYNOS990_H_
++#define _PEXPERT_ARM_EXYNOS990_H_
++#define EXYNOS990 1
++#define NO_MONITOR 1
++#define NO_ECORE 1
++#define ARM_ARCH_TIMER 1
++/* The generic IRQ implementation detects arm,gic-400 and uses its GICv2 path. */
++#define GENERIC_GIC_V3_IRQ 1
++#define GENERIC_PSCI_SMP 1
++#define __ARM_PAN_AVAILABLE__ 1
++#define __ARM_ARCH__ 8
++#define __ARM_VMSA__ 8
++#define __ARM_VFP__ 4
++#define __ARM_COHERENT_CACHE__ 1
++#define __ARM_DEBUG__ 7
++#define __ARM64_PMAP_SUBPAGE_L1__ 1
++#endif /* _PEXPERT_ARM_EXYNOS990_H_ */
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/pexpert/pexpert/arm64/Makefile b/pexpert/pexpert/arm64/Makefile
+--- a/pexpert/pexpert/arm64/Makefile	2026-11-23 21:31:45.098568839 +0900
++++ b/pexpert/pexpert/arm64/Makefile	2026-11-08 20:27:03.000000000 +0900
+@@ -17,7 +17,8 @@
+ 	boot.h \
+ 	H13.h \
+ 	VMAPPLE.h \
+-	BCM2837.h
++	BCM2837.h \
++	EXYNOS990.h
+ 
+ 
+ # Headers installed into System.framework/PrivateHeaders (userspace internal SDK only).
+diff -urN '--exclude=BUILD' '--exclude=.git' '--exclude=__pycache__' a/pexpert/pexpert/arm64/board_config.h b/pexpert/pexpert/arm64/board_config.h
+--- a/pexpert/pexpert/arm64/board_config.h	2026-11-23 21:31:45.163691932 +0900
++++ b/pexpert/pexpert/arm64/board_config.h	2026-11-08 20:27:03.000000000 +0900
+@@ -97,6 +97,15 @@
+ #define CORE_NCTRS                     8 /* Placeholder; KPC is not enabled for this target */
+ #endif  /* ARM64_BOARD_CONFIG_BCM2837 */
+ 
++#ifdef ARM64_BOARD_CONFIG_EXYNOS990
++#include <pexpert/arm64/EXYNOS990.h>
++
++#define MAX_L2_CLINE                   7
++#define MAX_CPUS                       8
++#define MAX_CPU_CLUSTERS               3
++#define CORE_NCTRS                     8
++#endif /* ARM64_BOARD_CONFIG_EXYNOS990 */
++
+ #ifdef ARM64_BOARD_CONFIG_VMAPPLE
+ #include <pexpert/arm64/VMAPPLE.h>
+ 

@@ -1,0 +1,24 @@
+## @file
+# N986B live-FDT-derived map with isolated high RAM TWRP stream reservation
+# SPDX-License-Identifier: BSD-2-Clause-Patent
+##
+[Defines]
+  INF_VERSION                    = 0x00010005
+  BASE_NAME                      = PlatformMemoryMapLibN986BUiHigh
+  FILE_GUID                      = 9A657889-81C1-4B74-A7E2-D29863D04AF1
+  MODULE_TYPE                    = BASE
+  VERSION_STRING                 = 1.0
+  LIBRARY_CLASS                  = PlatformMemoryMapLib
+
+[Sources]
+  PlatformMemoryMapLibN986BUiHigh.c
+
+[Packages]
+  ArmPkg/ArmPkg.dec
+  MdePkg/MdePkg.dec
+  MdeModulePkg/MdeModulePkg.dec
+  EmbeddedPkg/EmbeddedPkg.dec
+  Silicon/Samsung/ExynosPkg/ExynosPkg.dec
+
+[LibraryClasses]
+  BaseLib
